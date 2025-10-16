@@ -10,7 +10,7 @@ async function askLLM(prompt) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-5-instant", 
+      model: "gpt-5", 
       input: prompt,
     }),
   });
@@ -23,7 +23,7 @@ async function askLLM(prompt) {
     data.output_text ??
     data.output?.[0]?.content?.[0]?.text ??
     "";
-  return out || "Извини, я не смог сформировать ответ.";
+  return out || "Oops.";
 }
 
 bot.on("text", async (ctx) => {
