@@ -1,0 +1,10 @@
+{
+  "name": "telegram-ai-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "20.x" },
+  "dependencies": {
+    "telegraf": "^4.16.3"
+  }
+}
