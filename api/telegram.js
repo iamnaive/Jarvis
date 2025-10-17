@@ -1,138 +1,83 @@
-// api/telegram.js — Telegram bot on Vercel with diagnostics & 9s timeout.
-// Env: BOT_TOKEN, OPENAI_API_KEY, MODEL_ID (e.g. gpt-4o-mini or gpt-5), SYSTEM_PROMPT (optional)
+// api/telegram.js — Edge Runtime (до ~30s). Без Telegraf.
+// Env: BOT_TOKEN, OPENAI_API_KEY, MODEL_ID (напр. gpt-4o-mini), SYSTEM_PROMPT (optional)
+export const runtime = 'edge';
 
-import { Telegraf } from "telegraf";
-
-const bot = new Telegraf(process.env.BOT_TOKEN);
-const MODEL_ID = process.env.MODEL_ID || "gpt-4o-mini";
-const SYSTEM_PROMPT =
-  process.env.SYSTEM_PROMPT ||
-  "You are an assistant. Always reply in concise, natural English. Do not switch languages.";
-
-// ---- fetch with 9s timeout (fits Vercel Hobby limit)
-async function fetchWithTimeout(url, options = {}, ms = 9000) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), ms);
-  try {
-    return await fetch(url, { ...options, signal: ctrl.signal });
-  } finally {
-    clearTimeout(id);
-  }
-}
+const MODEL_ID = process.env.MODEL_ID || 'gpt-4o-mini';
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
+  'You are an assistant. Always reply in concise, natural English. Do not switch languages.';
 
 function buildPrompt(userText) {
-  const englishRule =
-    "Always respond in English. Do not switch languages, even if the user writes in another language.";
-  return [
-    `System: ${SYSTEM_PROMPT}\n${englishRule}`,
-    `User: ${userText}`,
-    "Assistant:"
-  ].join("\n");
+  const englishRule = 'Always respond in English. Do not switch languages, even if the user writes in another language.';
+  return `System: ${SYSTEM_PROMPT}\n${englishRule}\nUser: ${userText}\nAssistant:`;
 }
 
-async function askLLM(userText) {
+async function askLLM(userText, signal) {
   const prompt = buildPrompt(userText);
-
-  const res = await fetchWithTimeout(
-    "https://api.openai.com/v1/responses",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ model: MODEL_ID, input: prompt }),
+  const r = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
     },
-    9000
-  );
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    console.error("LLM error:", res.status, text);
-    let msg = `LLM error ${res.status}`;
-    try {
-      const j = JSON.parse(text);
-      if (j?.error?.message) msg += `: ${j.error.message}`;
-    } catch {}
+    body: JSON.stringify({ model: MODEL_ID, input: prompt }),
+    signal
+  });
+  if (!r.ok) {
+    let msg = `LLM error ${r.status}`;
+    try { const j = await r.json(); if (j?.error?.message) msg += `: ${j.error.message}`; } catch {}
     throw new Error(msg);
   }
-
-  const data = await res.json().catch(() => ({}));
-  const out = data.output_text ?? data.output?.[0]?.content?.[0]?.text ?? "";
-  return out || "I couldn't produce a response.";
+  const data = await r.json();
+  return data.output_text ?? data.output?.[0]?.content?.[0]?.text ?? 'I could not produce a response.';
 }
 
-// Log updates (see Vercel → Deployments → Logs)
-bot.use(async (ctx, next) => {
-  console.log("update kind:", ctx.updateType);
-  return next();
-});
+async function sendMessage(chatId, text) {
+  await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text })
+  });
+}
 
-bot.start((ctx) =>
-  ctx.reply("Ready. I answer in English. Try: !diag, !test, or send a message.")
-);
+export default async function handler(req) {
+  if (req.method === 'GET') return new Response('ok', { status: 200 });
+  if (req.method !== 'POST') return new Response('Not Found', { status: 404 });
 
-bot.help((ctx) =>
-  ctx.reply("Commands: /start, /help, /id, !diag, !test, !echo <text>")
-);
+  const update = await req.json().catch(() => ({}));
+  const chatId = update?.message?.chat?.id;
+  const text   = update?.message?.text ?? update?.message?.caption ?? '';
 
-bot.command("id", (ctx) =>
-  ctx.reply(`Your user_id: ${ctx.from?.id}\nChat_id: ${ctx.chat?.id}`)
-);
+  if (!chatId || !text) return new Response('ok', { status: 200 });
 
-// Diagnostics & echo
-bot.on("text", async (ctx) => {
-  const msg = ctx.message?.text ?? "";
-  if (!msg) return;
-
-  if (msg === "!diag") {
-    const hasKey = Boolean(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.startsWith("sk-"));
-    const tail = hasKey ? process.env.OPENAI_API_KEY.slice(-6) : "none";
-    const info =
-      `Model: ${MODEL_ID}\n` +
-      `OPENAI_API_KEY: ${hasKey ? `present (…${tail})` : "missing/invalid"}\n` +
-      `System prompt: ${SYSTEM_PROMPT.slice(0, 60)}${SYSTEM_PROMPT.length > 60 ? "..." : ""}`;
-    return ctx.reply(info, { reply_to_message_id: ctx.message.message_id });
-  }
-
-  if (msg === "!test") {
-    try {
-      const out = await askLLM("Say 'OK' if you received this.");
-      return ctx.reply(out, { reply_to_message_id: ctx.message.message_id });
-    } catch (e) {
-      const t = typeof e?.message === "string" ? e.message : "Unknown error";
-      return ctx.reply(`TEST FAIL: ${t}`, { reply_to_message_id: ctx.message.message_id });
-    }
-  }
-
-  if (msg.startsWith("!echo ")) {
-    return ctx.reply(msg.slice(6), { reply_to_message_id: ctx.message.message_id });
-  }
-
-  // Normal AI flow
   try {
-    await ctx.sendChatAction("typing");
-    const answer = await askLLM(msg);
-    await ctx.reply(answer, { reply_to_message_id: ctx.message.message_id });
-  } catch (e) {
-    console.error("Handler error:", e);
-    const t = typeof e?.message === "string" ? e.message : "Unknown error";
-    if (t.includes("429")) {
-      await ctx.reply("Oops: API quota exceeded. Check Billing (platform.openai.com → Billing).");
-    } else if (t.includes("model_not_found")) {
-      await ctx.reply("Oops: model not found. Set MODEL_ID to a model you have access to (e.g. gpt-4o-mini).");
-    } else if (t.toLowerCase().includes("abort") || t.toLowerCase().includes("signal")) {
-      await ctx.reply("Oops: model timed out (<9s). Please try again or shorten the message.");
-    } else if (t.includes("401")) {
-      await ctx.reply("Oops: invalid API key. Update OPENAI_API_KEY in Vercel env and redeploy.");
-    } else {
-      await ctx.reply(`Oops: ${t}`);
-    }
-  }
-});
+    // показываем "typing"
+    fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendChatAction`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, action: 'typing' })
+    }).catch(()=>{});
 
-export default async function handler(req, res) {
-  if (req.method === "GET") return res.status(200).send("ok");
-  const h = bot.webhookCallback("/api/telegram");
-  return h(req, res);
+    // даём модели до ~25s (Edge держит до ~30s)
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), 25000);
+
+    let reply;
+    try {
+      reply = await askLLM(text, ctrl.signal);
+    } finally {
+      clearTimeout(to);
+    }
+
+    await sendMessage(chatId, reply);
+    return new Response('ok', { status: 200 });
+  } catch (e) {
+    const msg = String(e?.message || e || 'unknown error');
+    await sendMessage(chatId,
+      msg.includes('429') ? 'Oops: API quota exceeded. Check Billing.' :
+      msg.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-4o-mini).' :
+      msg.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
+      `Oops: ${msg}`
+    );
+    return new Response('ok', { status: 200 });
+  }
 }
