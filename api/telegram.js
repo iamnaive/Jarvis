@@ -1,10 +1,19 @@
-// api/telegram.js — Edge webhook (Vercel). Robust, always 200 on errors.
+// api/telegram.js — Telegram webhook on Vercel Edge (долгий таймаут, без Telegraf).
+// Env vars (Vercel → Project → Settings → Environment Variables):
+//   BOT_TOKEN        - Telegram BotFather token
+//   OPENAI_API_KEY   - OpenAI API key (billing enabled in the same org/project)
+//   MODEL_ID         - e.g. "gpt-4o-mini" (стартовый вариант; позже можно "gpt-5" / "gpt-5-mini")
+//   SYSTEM_PROMPT    - optional, global style/instructions (English-only по умолчанию)
+
 export const runtime = 'edge';
 
 const MODEL_ID = process.env.MODEL_ID || 'gpt-4o-mini';
 const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   'You are an assistant. Always reply in concise, natural English. Do not switch languages.';
+
+// --- helpers ---
+const log = (...a) => { try { console.log(...a); } catch {} };
 
 function buildPrompt(userText) {
   const englishRule =
@@ -32,64 +41,71 @@ async function askLLM(userText, signal) {
 }
 
 async function tg(method, payload) {
-  // не кидаем исключений из Telegram-запросов — чтобы не уронить функцию
   try {
-    await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/${method}`, {
+    const res = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/${method}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-  } catch { /* ignore */ }
+    if (!res.ok) {
+      const t = await res.text().catch(()=>'');
+      log('TG error', method, res.status, t);
+    }
+  } catch (e) {
+    log('TG fetch error', method, String(e?.message || e));
+  }
 }
 
+// --- handler ---
 export default async function handler(req) {
-  // health check
+  // healthcheck
   if (req.method === 'GET') return new Response('ok', { status: 200 });
   if (req.method !== 'POST') return new Response('ok', { status: 200 });
 
-  let update;
-  try {
-    update = await req.json();
-  } catch {
-    return new Response('ok', { status: 200 });
-  }
+  let update = {};
+  try { update = await req.json(); } catch {}
 
-  // поддержим разные типы апдейтов
+  // поддерживаем разные типы апдейтов (личные сообщения, редактирования, посты в канале)
   const msg = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
   const chatId = msg?.chat?.id;
-  const text = msg?.text ?? msg?.caption ?? '';
+  const text   = msg?.text ?? msg?.caption ?? '';
 
-  // если это не текст — просто подтвердим приём
-  if (!chatId || !text) return new Response('ok', { status: 200 });
+  if (!chatId) return new Response('ok', { status: 200 });
 
-  // проверим env заранее
-  if (!process.env.BOT_TOKEN || !process.env.OPENAI_API_KEY) {
-    await tg('sendMessage', { chat_id: chatId, text: 'Oops: missing server configuration (API key or bot token).' });
+  // быстрый пинг без модели — удобно для диагностики
+  if (text && text.trim().toLowerCase() === '!ping') {
+    await tg('sendMessage', { chat_id: chatId, text: 'pong' });
     return new Response('ok', { status: 200 });
   }
 
-  // show typing (не ждём)
+  // проверка env заранее, чтобы не падать 500
+  if (!process.env.BOT_TOKEN || !process.env.OPENAI_API_KEY) {
+    await tg('sendMessage', { chat_id: chatId, text: 'Oops: missing BOT_TOKEN or OPENAI_API_KEY on server.' });
+    return new Response('ok', { status: 200 });
+  }
+
+  // показываем "typing" (fire-and-forget)
   tg('sendChatAction', { chat_id: chatId, action: 'typing' });
 
   try {
-    // до ~25с на ответ модели
+    // даём модели до ~25s (Edge держит ~30s)
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), 25000);
     let reply;
-    try { reply = await askLLM(text, ctrl.signal); }
+    try { reply = await askLLM(text || '', ctrl.signal); }
     finally { clearTimeout(to); }
 
     await tg('sendMessage', { chat_id: chatId, text: reply });
   } catch (e) {
-    const msg = String(e?.message || e || 'unknown error');
+    const m = String(e?.message || e || 'unknown error');
     const friendly =
-      msg.includes('429') ? 'Oops: API quota exceeded. Check Billing.' :
-      msg.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-4o-mini).' :
-      msg.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
-      `Oops: ${msg}`;
+      m.includes('429') ? 'Oops: API quota exceeded. Check Billing.' :
+      m.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-4o-mini).' :
+      m.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
+      `Oops: ${m}`;
     await tg('sendMessage', { chat_id: chatId, text: friendly });
   }
 
-  // Telegram должен получить 200, иначе он будет ретраить
+  // Telegram должен получить 200 в любом случае, иначе он будет ретраить
   return new Response('ok', { status: 200 });
 }
