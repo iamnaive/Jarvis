@@ -1,0 +1,6 @@
+{
+  "functions": {
+    "api/ping.js": { "runtime": "edge" },
+    "api/telegram.js": { "runtime": "edge" }
+  }
+}
