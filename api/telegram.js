@@ -1,17 +1,5 @@
-// Telegram AI bot on Vercel with System Prompt + English-only + optional chat memory via Upstash Redis.
-// Env (Vercel → Project → Settings → Environment Variables):
-//   BOT_TOKEN                - Telegram bot token (from @BotFather)
-//   OPENAI_API_KEY           - OpenAI API key (sk-...)
-//   MODEL_ID                 - e.g. "gpt-4o-mini" or "gpt-5" (if available)
-//   SYSTEM_PROMPT            - global role, e.g. "Always reply in concise, natural English..."
-//   UPSTASH_REDIS_REST_URL   - optional, for chat memory
-//   UPSTASH_REDIS_REST_TOKEN - optional, for chat memory
-//
-// Route: /api/telegram  (webhook target)
-// Notes:
-// - Replies are always in English (hard rule inside prompt).
-// - Commands: /start, /help, /id, /context, /clear
-// - If Upstash vars are unset, the bot will work without memory.
+// api/telegram.js — Telegram bot on Vercel with hard timeout & clear errors.
+// Env: BOT_TOKEN, OPENAI_API_KEY, MODEL_ID (e.g. gpt-4o-mini or gpt-5), SYSTEM_PROMPT (optional)
 
 import { Telegraf } from "telegraf";
 
@@ -21,86 +9,42 @@ const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   "You are an assistant. Always reply in concise, natural English. Do not switch languages.";
 
-// ---- Upstash Redis (optional) ----
-const UPS_URL = process.env.UPSTASH_REDIS_REST_URL || "";
-const UPS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
-
-async function redisCmd(cmd, ...args) {
-  if (!UPS_URL || !UPS_TOKEN) return null;
-  const body = { command: [cmd, ...args] };
-  const r = await fetch(UPS_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${UPS_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    console.error("Upstash error:", r.status, t);
-    return null;
+// --- fetch with timeout (prevents hanging “typing...”)
+async function fetchWithTimeout(url, options = {}, ms = 12000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(id);
   }
-  const data = await r.json().catch(() => ({}));
-  return data?.result ?? null;
 }
 
-const MAX_TURNS = 8; // number of user/assistant pairs to keep
-const memKey = (chatId) => `tg:ctx:v1:${chatId}`;
-
-async function memPush(chatId, role, text) {
-  if (!UPS_URL || !UPS_TOKEN) return;
-  const key = memKey(chatId);
-  await redisCmd("RPUSH", key, JSON.stringify({ role, text }));
-  await redisCmd("LTRIM", key, String(-MAX_TURNS * 2), "-1");
-}
-
-async function memGet(chatId) {
-  if (!UPS_URL || !UPS_TOKEN) return [];
-  const key = memKey(chatId);
-  const arr = (await redisCmd("LRANGE", key, "0", "-1")) || [];
-  return arr
-    .map((s) => {
-      try { return JSON.parse(s); } catch { return null; }
-    })
-    .filter(Boolean);
-}
-
-async function memClear(chatId) {
-  if (!UPS_URL || !UPS_TOKEN) return;
-  await redisCmd("DEL", memKey(chatId));
-}
-
-// ---- Prompt building ----
-// We enforce English-only and include global/system + per-chat context + recent turns.
-function buildPrompt({ systemGlobal, systemPerChat, history, userText }) {
+function buildPrompt(userText) {
   const englishRule =
     "Always respond in English. Do not switch languages, even if the user writes in another language.";
-  const histTxt = (history || [])
-    .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`)
-    .join("\n");
   return [
-    `System: ${systemGlobal}\n${englishRule}`.trim(),
-    systemPerChat ? `System: [CHAT-CONTEXT] ${systemPerChat}` : null,
-    histTxt || null,
+    `System: ${SYSTEM_PROMPT}\n${englishRule}`,
     `User: ${userText}`,
-    `Assistant:`
-  ].filter(Boolean).join("\n");
+    "Assistant:"
+  ].join("\n");
 }
 
-// ---- OpenAI Responses API ----
-async function askLLM({ prompt }) {
-  const res = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
+async function askLLM(userText) {
+  const prompt = buildPrompt(userText);
+
+  const res = await fetchWithTimeout(
+    "https://api.openai.com/v1/responses",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: MODEL_ID, input: prompt }),
     },
-    body: JSON.stringify({
-      model: MODEL_ID,
-      input: prompt
-    }),
-  });
+    12000 // 12s hard timeout to fit Vercel limits
+  );
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -114,94 +58,62 @@ async function askLLM({ prompt }) {
   }
 
   const data = await res.json().catch(() => ({}));
-  const out =
-    data.output_text ??
-    data.output?.[0]?.content?.[0]?.text ??
-    "";
+  const out = data.output_text ?? data.output?.[0]?.content?.[0]?.text ?? "";
   return out || "I couldn't produce a response.";
 }
 
-// ---- Commands ----
-bot.start(async (ctx) => {
-  await ctx.reply(
-    "Ready. Send a message — I’ll reply in English using the configured context.\nCommands: /context, /clear, /id, /help"
-  );
+// Log updates to see activity in Vercel logs
+bot.use(async (ctx, next) => {
+  console.log("update kind:", ctx.updateType);
+  return next();
 });
 
-bot.help(async (ctx) => {
-  await ctx.reply(
-    "I answer in English.\n/context — show or set per-chat context\n/context set <text> — set chat context (overrides global)\n/clear — clear chat history\n/id — show your user/chat IDs"
-  );
-});
+bot.start((ctx) =>
+  ctx.reply("Ready. I will answer in English. Try sending: ping")
+);
 
-bot.command("id", async (ctx) => {
-  await ctx.reply(`Your user_id: ${ctx.from?.id}\nChat_id: ${ctx.chat?.id}`);
-});
+bot.help((ctx) =>
+  ctx.reply("Commands: /start, /help, /id, or just send a text message.")
+);
 
-bot.command("clear", async (ctx) => {
-  await memClear(ctx.chat.id);
-  await ctx.reply("Context cleared.");
-});
+bot.command("id", (ctx) =>
+  ctx.reply(`Your user_id: ${ctx.from?.id}\nChat_id: ${ctx.chat?.id}`)
+);
 
-bot.command("context", async (ctx) => {
-  const text = ctx.message?.text || "";
-  const [, ...rest] = text.split(" ");
-  const sub = (rest[0] || "").toLowerCase();
-
-  if (sub === "set") {
-    const custom = rest.slice(1).join(" ").trim();
-    if (!custom) {
-      await ctx.reply("Usage: /context set <system prompt text>");
-      return;
-    }
-    await memClear(ctx.chat.id);
-    // Store per-chat "system" as first memory entry (marker role "system")
-    await memPush(ctx.chat.id, "system", custom);
-    await ctx.reply("Okay, chat context updated.");
-  } else {
-    const h = await memGet(ctx.chat.id);
-    const sys = h.find((m) => m.role === "system")?.text;
-    await ctx.reply(`Current context:\n${sys || SYSTEM_PROMPT}`);
-  }
-});
-
-// ---- Main text handler ----
+// Quick echo to verify delivery path (type: !echo hello)
 bot.on("text", async (ctx) => {
-  const userText = ctx.message?.text ?? "";
-  if (!userText) return;
+  const msg = ctx.message?.text ?? "";
+  if (!msg) return;
+
+  // Debug escape hatch
+  if (msg.startsWith("!echo ")) {
+    return ctx.reply(msg.slice(6), { reply_to_message_id: ctx.message.message_id });
+  }
+
   try {
-    const raw = await memGet(ctx.chat.id);
-    const perChatSystem = raw.find((m) => m.role === "system")?.text || null;
-    const turns = raw.filter((m) => m.role !== "system");
-
     await ctx.sendChatAction("typing");
-
-    const prompt = buildPrompt({
-      systemGlobal: SYSTEM_PROMPT,
-      systemPerChat: perChatSystem,
-      history: turns,
-      userText
-    });
-
-    const answer = await askLLM({ prompt });
-
-    await memPush(ctx.chat.id, "user", userText);
-    await memPush(ctx.chat.id, "assistant", answer);
-
+    const answer = await askLLM(msg);
     await ctx.reply(answer, { reply_to_message_id: ctx.message.message_id });
   } catch (e) {
     console.error("Handler error:", e);
     const t = typeof e?.message === "string" ? e.message : "Unknown error";
-    await ctx.reply(`Oops: ${t}`);
+    // Distinguish common cases
+    if (t.includes("429")) {
+      await ctx.reply(
+        "Oops: API quota exceeded. Please enable/pay billing on platform.openai.com → Billing, then try again."
+      );
+    } else if (t.includes("The user aborted a request") || t.includes("signal")) {
+      await ctx.reply(
+        "Oops: model timed out. Please try again (I use a 12s timeout to avoid hanging)."
+      );
+    } else {
+      await ctx.reply(`Oops: ${t}`);
+    }
   }
 });
 
-// ---- Vercel webhook entry ----
 export default async function handler(req, res) {
-  if (req.method === "GET") {
-    res.status(200).send("ok");
-    return;
-  }
+  if (req.method === "GET") return res.status(200).send("ok");
   const h = bot.webhookCallback("/api/telegram");
   return h(req, res);
 }
