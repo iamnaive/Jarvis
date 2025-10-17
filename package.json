@@ -1,10 +1,11 @@
 {
   "name": "telegram-ai-bot",
-  "version": "1.0.0",
-  "description": "AI-powered Telegram bot for groups",
+  "version": "2.0.0",
+  "description": "AI-powered Telegram bot with GPT-4",
   "main": "api/bot.js",
   "scripts": {
-    "start": "node api/bot.js"
+    "start": "node api/bot.js",
+    "dev": "NODE_ENV=development node api/bot.js"
   },
   "dependencies": {
     "axios": "^1.6.0",
