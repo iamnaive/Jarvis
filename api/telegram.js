@@ -5,6 +5,8 @@ const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   'You are an assistant. Always reply in concise, natural English. Do not switch languages.';
 
+const log = (...a) => { try { console.log(...a); } catch {} };
+
 function buildPrompt(userText) {
   const englishRule =
     'Always respond in English. Do not switch languages, even if the user writes in another language.';
@@ -32,12 +34,18 @@ async function askLLM(userText, signal) {
 
 async function tg(method, payload) {
   try {
-    await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/${method}`, {
+    const res = await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/${method}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-  } catch {}
+    if (!res.ok) {
+      const t = await res.text().catch(()=> '');
+      log('TG error', method, res.status, t);
+    }
+  } catch (e) {
+    log('TG fetch error', method, String(e?.message || e));
+  }
 }
 
 export default async function handler(req) {
