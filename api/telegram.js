@@ -1,4 +1,4 @@
-// api/telegram.js — Telegram bot on Vercel with hard timeout & clear errors.
+// api/telegram.js — Telegram bot on Vercel with diagnostics & 9s timeout.
 // Env: BOT_TOKEN, OPENAI_API_KEY, MODEL_ID (e.g. gpt-4o-mini or gpt-5), SYSTEM_PROMPT (optional)
 
 import { Telegraf } from "telegraf";
@@ -9,8 +9,8 @@ const SYSTEM_PROMPT =
   process.env.SYSTEM_PROMPT ||
   "You are an assistant. Always reply in concise, natural English. Do not switch languages.";
 
-// --- fetch with timeout (prevents hanging “typing...”)
-async function fetchWithTimeout(url, options = {}, ms = 12000) {
+// ---- fetch with 9s timeout (fits Vercel Hobby limit)
+async function fetchWithTimeout(url, options = {}, ms = 9000) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), ms);
   try {
@@ -43,7 +43,7 @@ async function askLLM(userText) {
       },
       body: JSON.stringify({ model: MODEL_ID, input: prompt }),
     },
-    12000 // 12s hard timeout to fit Vercel limits
+    9000
   );
 
   if (!res.ok) {
@@ -62,34 +62,54 @@ async function askLLM(userText) {
   return out || "I couldn't produce a response.";
 }
 
-// Log updates to see activity in Vercel logs
+// Log updates (see Vercel → Deployments → Logs)
 bot.use(async (ctx, next) => {
   console.log("update kind:", ctx.updateType);
   return next();
 });
 
 bot.start((ctx) =>
-  ctx.reply("Ready. I will answer in English. Try sending: ping")
+  ctx.reply("Ready. I answer in English. Try: !diag, !test, or send a message.")
 );
 
 bot.help((ctx) =>
-  ctx.reply("Commands: /start, /help, /id, or just send a text message.")
+  ctx.reply("Commands: /start, /help, /id, !diag, !test, !echo <text>")
 );
 
 bot.command("id", (ctx) =>
   ctx.reply(`Your user_id: ${ctx.from?.id}\nChat_id: ${ctx.chat?.id}`)
 );
 
-// Quick echo to verify delivery path (type: !echo hello)
+// Diagnostics & echo
 bot.on("text", async (ctx) => {
   const msg = ctx.message?.text ?? "";
   if (!msg) return;
 
-  // Debug escape hatch
+  if (msg === "!diag") {
+    const hasKey = Boolean(process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY.startsWith("sk-"));
+    const tail = hasKey ? process.env.OPENAI_API_KEY.slice(-6) : "none";
+    const info =
+      `Model: ${MODEL_ID}\n` +
+      `OPENAI_API_KEY: ${hasKey ? `present (…${tail})` : "missing/invalid"}\n` +
+      `System prompt: ${SYSTEM_PROMPT.slice(0, 60)}${SYSTEM_PROMPT.length > 60 ? "..." : ""}`;
+    return ctx.reply(info, { reply_to_message_id: ctx.message.message_id });
+  }
+
+  if (msg === "!test") {
+    try {
+      const out = await askLLM("Say 'OK' if you received this.");
+      return ctx.reply(out, { reply_to_message_id: ctx.message.message_id });
+    } catch (e) {
+      const t = typeof e?.message === "string" ? e.message : "Unknown error";
+      return ctx.reply(`TEST FAIL: ${t}`, { reply_to_message_id: ctx.message.message_id });
+    }
+  }
+
   if (msg.startsWith("!echo ")) {
     return ctx.reply(msg.slice(6), { reply_to_message_id: ctx.message.message_id });
   }
 
+  // Normal AI flow
   try {
     await ctx.sendChatAction("typing");
     const answer = await askLLM(msg);
@@ -97,15 +117,14 @@ bot.on("text", async (ctx) => {
   } catch (e) {
     console.error("Handler error:", e);
     const t = typeof e?.message === "string" ? e.message : "Unknown error";
-    // Distinguish common cases
     if (t.includes("429")) {
-      await ctx.reply(
-        "Oops: API quota exceeded. Please enable/pay billing on platform.openai.com → Billing, then try again."
-      );
-    } else if (t.includes("The user aborted a request") || t.includes("signal")) {
-      await ctx.reply(
-        "Oops: model timed out. Please try again (I use a 12s timeout to avoid hanging)."
-      );
+      await ctx.reply("Oops: API quota exceeded. Check Billing (platform.openai.com → Billing).");
+    } else if (t.includes("model_not_found")) {
+      await ctx.reply("Oops: model not found. Set MODEL_ID to a model you have access to (e.g. gpt-4o-mini).");
+    } else if (t.toLowerCase().includes("abort") || t.toLowerCase().includes("signal")) {
+      await ctx.reply("Oops: model timed out (<9s). Please try again or shorten the message.");
+    } else if (t.includes("401")) {
+      await ctx.reply("Oops: invalid API key. Update OPENAI_API_KEY in Vercel env and redeploy.");
     } else {
       await ctx.reply(`Oops: ${t}`);
     }
