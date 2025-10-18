@@ -1,6 +1,0 @@
-{
-  "functions": {
-    "api/ping.js": { "runtime": "nodejs22.x" },
-    "api/bot.js":  { "runtime": "nodejs22.x" }
-  }
-}
