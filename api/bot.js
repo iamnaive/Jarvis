@@ -48,6 +48,12 @@ const SNAPSHOT_LINES = [
   "Expect the snapshot a day ahead of the mainnet launch.",
   "Snapshot happens one day before mainnet."
 ];
+const GREET_LINES = [
+  "Hey — Jarvis here. How can I help?",
+  "Hi there, I’m Jarvis. What do you need?",
+  "Hello! Jarvis on the line — how can I assist?",
+  "Hey! Jarvis here. Ask away."
+];
 
 // ---------- English-only keyword triggers ----------
 const RE_WL       = /\b(whitelist|allowlist)\b/i;
@@ -58,6 +64,8 @@ const RE_BYE      = /^(thanks|thank you|ok|okay|got it|all good|bye|goodbye)$/i;
 const RE_GWOOLLY  = /\bgwoolly\b/i;
 const RE_TWITTER  = /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/i;
 const RE_SNAPSHOT = /\b(snapshot)\b/i;
+const RE_JARVIS   = /\bjarvis\b/i;
+const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*evening|good\s*night|sup|what'?s\s*up)\b/i;
 
 // ---------- Telegram helper ----------
 async function tg(method, payload) {
@@ -189,14 +197,21 @@ export default async function handler(req, res) {
     return ACK();
   }
 
+  // ---- NEW: Greeting when tagged or when "Jarvis" is used
+  const mentioned  = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
+  const nameCalled = RE_JARVIS.test(lower);
+  if ((mentioned || nameCalled) && RE_GREET.test(lower)) {
+    await tg('sendMessage', { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg.message_id });
+    return ACK(); // reply once; follow-up messages will be handled as usual
+  }
+
   // Group routing: mention/reply or passive heuristics
   let pass = true;
   if (isGroup) {
-    const mentioned  = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
     const replyToBot = msg?.reply_to_message?.from?.is_bot &&
       (!msg?.reply_to_message?.from?.username ||
        msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME);
-    if (!mentioned && !replyToBot) {
+    if (!mentioned && !replyToBot && !nameCalled) {
       pass = shouldReplyPassive(text); // for Privacy OFF case
     }
   }
