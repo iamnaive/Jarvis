@@ -1,5 +1,6 @@
 // /api/bot.js — Telegram webhook on Vercel (Node serverless, NO Express)
-// Env: TELEGRAM_TOKEN (or BOT_TOKEN), OPENAI_API_KEY, MODEL_ID (e.g., gpt-4o-mini), optional SYSTEM_PROMPT, BOT_USERNAME
+// Env: TELEGRAM_TOKEN (or BOT_TOKEN), OPENAI_API_KEY, MODEL_ID (e.g., gpt-4o-mini),
+// optional SYSTEM_PROMPT, BOT_USERNAME
 
 const TG_TOKEN     = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN;
 const OPENAI_KEY   = process.env.OPENAI_API_KEY;
@@ -183,6 +184,49 @@ export default async function handler(req, res) {
 
   const lower = (text || '').toLowerCase();
 
+  // ---- DIRECT MENTION / NAME-CALL: answer by meaning (LLM), no triggers required
+  const mentioned  = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
+  const nameCalled = RE_JARVIS.test(lower);
+  if (mentioned || nameCalled) {
+    // Greeting form when it's a hello + mention/name
+    if (RE_GREET.test(lower)) {
+      await tg('sendMessage', { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg.message_id });
+      return ACK();
+    }
+
+    // Clean the text (strip @bot and "jarvis") before sending to LLM
+    const cleaned = (text || '')
+      .replace(new RegExp(`@${BOT_USERNAME}`, 'ig'), '')
+      .replace(/jarvis/ig, '')
+      .trim();
+
+    if (!OPENAI_KEY) {
+      await tg('sendMessage', { chat_id: chatId, text: "OpenAI API key is missing on the server." });
+      return ACK();
+    }
+
+    // typing (fire-and-forget)
+    tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(()=>{});
+
+    try {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 9000);
+      let reply;
+      try { reply = await askLLM(cleaned || "Please greet briefly and ask how you can help.", ctrl.signal); }
+      finally { clearTimeout(to); }
+      await tg('sendMessage', { chat_id: chatId, text: reply, reply_to_message_id: msg.message_id });
+    } catch (e) {
+      const m = String(e?.message || e || 'unknown error');
+      const friendly =
+        m.includes('429') ? 'Oops: API quota exceeded. Check Billing.' :
+        m.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-4o-mini).' :
+        m.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
+        `Oops: ${m}`;
+      await tg('sendMessage', { chat_id: chatId, text: friendly, reply_to_message_id: msg.message_id });
+    }
+    return ACK();
+  }
+
   // ---- MUST-REPLY (no tag) triggers:
   if (RE_GWOOLLY.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg.message_id });
@@ -197,21 +241,13 @@ export default async function handler(req, res) {
     return ACK();
   }
 
-  // ---- NEW: Greeting when tagged or when "Jarvis" is used
-  const mentioned  = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
-  const nameCalled = RE_JARVIS.test(lower);
-  if ((mentioned || nameCalled) && RE_GREET.test(lower)) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg.message_id });
-    return ACK(); // reply once; follow-up messages will be handled as usual
-  }
-
   // Group routing: mention/reply or passive heuristics
   let pass = true;
   if (isGroup) {
     const replyToBot = msg?.reply_to_message?.from?.is_bot &&
       (!msg?.reply_to_message?.from?.username ||
        msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME);
-    if (!mentioned && !replyToBot && !nameCalled) {
+    if (!replyToBot) {
       pass = shouldReplyPassive(text); // for Privacy OFF case
     }
   }
