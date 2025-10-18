@@ -6,71 +6,58 @@ const OPENAI_KEY   = process.env.OPENAI_API_KEY;
 const MODEL_ID     = process.env.MODEL_ID || 'gpt-4o-mini';
 const BOT_USERNAME = (process.env.BOT_USERNAME || '').toLowerCase(); // e.g. "jarviseggsbot"
 
+const CONTRACT_ADDR = '0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7';
+
 const rnd = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const log = (...a) => { try { console.log(...a); } catch {} };
 
-// ---------- CANNED REPLIES (EN only, multiple phrasings) ----------
+// ---------- Quick canned replies (EN only) ----------
 const WL_LINES = [
-  "Guaranteed whitelist = **5** Woolly Eggs NFTs.",
-  "Hold **5** Woolly Eggs → you’re guaranteed on the whitelist.",
-  "Whitelist is guaranteed when you hold **5** Woolly Eggs NFTs.",
-  "With **5** Woolly Eggs you’re auto-whitelisted.",
-  "Holding **5** Woolly Eggs secures a guaranteed whitelist spot.",
-  "**5** Woolly Eggs in your wallet = guaranteed whitelist.",
-  "Guarantee your whitelist by holding **5** Woolly Eggs NFTs."
+  `Guaranteed whitelist = 5 Woolly Eggs NFTs. Contract: ${CONTRACT_ADDR}`,
+  `Hold 5 Woolly Eggs — you’re guaranteed on the whitelist. Contract: ${CONTRACT_ADDR}`,
+  `Whitelist is guaranteed when you hold 5 Woolly Eggs NFTs. Contract: ${CONTRACT_ADDR}`,
+  `With 5 Woolly Eggs you’re auto-whitelisted. Contract: ${CONTRACT_ADDR}`
 ];
-
 const WE_ROLE_LINES = [
-  "The Telegram **WE** role requires **10** Syndicate NFTs.",
-  "To get the **WE** role in Telegram, hold **10** Syndicate NFTs.",
-  "**WE** role → hold **10** Syndicate NFTs (Telegram).",
-  "You’ll receive the **WE** Telegram role once you hold **10** Syndicate NFTs.",
-  "The **WE** role on Telegram is granted when you hold **10** Syndicate NFTs.",
-  "Hold **10** Syndicate NFTs to qualify for the Telegram **WE** role.",
-  "Owning **10** Syndicate NFTs unlocks the **WE** role in Telegram."
+  "The Telegram WE role requires 10 Syndicate NFTs.",
+  "To get the WE role in Telegram, hold 10 Syndicate NFTs.",
+  "WE role → hold 10 Syndicate NFTs (Telegram).",
+  "You’ll receive the WE Telegram role once you hold 10 Syndicate NFTs."
 ];
-
 const GAME_LINES = [
   "Want to earn some WOOL? Try the mini-game: https://wooligotchi.vercel.app/",
   "You can grind a bit of WOOL here: https://wooligotchi.vercel.app/",
   "Small WOOL boost: play https://wooligotchi.vercel.app/",
-  "For a little WOOL, check: https://wooligotchi.vercel.app/",
-  "Earn a little WOOL by playing: https://wooligotchi.vercel.app/",
-  "Grab some WOOL in the Wooligotchi mini-game: https://wooligotchi.vercel.app/",
-  "Play Wooligotchi to farm a bit of WOOL: https://wooligotchi.vercel.app/"
+  "For a little WOOL, check: https://wooligotchi.vercel.app/"
 ];
-
-const BYE_LINES = [
-  "Anytime. Take care!",
-  "You're welcome. Have a good one!",
-  "Glad to help. See you!",
-  "Happy to help—bye!",
-  "Cheers!",
-  "Until next time."
-];
-
-const CLARIFY_LINES = [
-  "What do you need?",
-  "How can I help?",
-  "Tell me what you’re looking for."
-];
-
-// NEW: randomized Gwoolly variants (plain / egg / yarn / both)
 const GWOOLLY_LINES = [
-  "Gwoolly",
-  "Gwoolly 🥚",
-  "Gwoolly 🧶",
-  "Gwoolly 🥚🧶",
-  "Gwoolly 🧶🥚"
+  "Ping — I’m here. How can I help?",
+  "Hey! Need anything about Woolly Eggs?",
+  "Here and listening. What do you need?",
+  "Hi there — what can I do for you?"
+];
+const TWITTER_LINES = [
+  "Official X (Twitter): https://x.com/WoollyEggs",
+  "You can follow us on X here: https://x.com/WoollyEggs",
+  "Our X (Twitter) page: https://x.com/WoollyEggs",
+  "X link: https://x.com/WoollyEggs"
+];
+const SNAPSHOT_LINES = [
+  "The snapshot will occur one day before the mainnet launch.",
+  "Snapshot is planned for 24 hours prior to mainnet going live.",
+  "Expect the snapshot a day ahead of the mainnet launch.",
+  "Snapshot happens one day before mainnet."
 ];
 
 // ---------- English-only keyword triggers ----------
-const RE_WL     = /\b(whitelist|allowlist)\b/i;
-const RE_WE     = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
-const RE_SYN    = /\b(syndicate)\b/i;
-const RE_GAME   = /\b(wooligotchi|wooli?gotchi|mini-?game|game|wool)\b/i;
-const RE_BYE    = /^(thanks|thank you|ok|okay|got it|all good|bye|goodbye)$/i;
-const RE_GWOOL  = /\b(gwoolly|gwolly|gwooly)\b/i;
+const RE_WL       = /\b(whitelist|allowlist)\b/i;
+const RE_WE       = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
+const RE_SYN      = /\b(syndicate)\b/i;
+const RE_GAME     = /\b(wooligotchi|wooli?gotchi|mini-?game|game|wool)\b/i;
+const RE_BYE      = /^(thanks|thank you|ok|okay|got it|all good|bye|goodbye)$/i;
+const RE_GWOOLLY  = /\bgwoolly\b/i;
+const RE_TWITTER  = /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/i;
+const RE_SNAPSHOT = /\b(snapshot)\b/i;
 
 // ---------- Telegram helper ----------
 async function tg(method, payload) {
@@ -98,8 +85,8 @@ Rules:
 - Do NOT proactively continue the conversation or ask follow-ups unless necessary.
 - If user says thanks/ok/bye, reply with one short closing line and stop.
 - If something about Woolly Eggs is unknown, say “I’m not sure” (do NOT invent lore).
-- If asked about whitelist: guaranteed whitelist requires **5 Woolly Eggs NFTs**.
-- If asked about the Telegram WE role: it requires **10 Syndicate NFTs**.
+- If asked about whitelist: guaranteed whitelist requires 5 Woolly Eggs NFTs (contract: ${CONTRACT_ADDR}).
+- If asked about the Telegram WE role: it requires 10 Syndicate NFTs.
 - If user asks about earning a bit of WOOL, suggest the mini-game: https://wooligotchi.vercel.app/
 `;
   return base.trim();
@@ -135,7 +122,7 @@ function looksLikeQuestion(txt) {
 function containsProjectKeywords(txt) {
   if (!txt) return false;
   const s = txt.toLowerCase();
-  return /\b(woolly\s*eggs|woolly|eggs|syndicate|wooligotchi|whitelist|allowlist|we\s*role|we-?role|mini-?game|wool)\b/.test(s);
+  return /\b(woolly\s*eggs|woolly|eggs|syndicate|wooligotchi|whitelist|allowlist|we\s*role|we-?role|mini-?game|wool|snapshot)\b/.test(s);
 }
 function isCommandy(txt) {
   if (!txt) return false;
@@ -148,7 +135,7 @@ function shouldReplyPassive(text) {
   if (looksLikeQuestion(text)) score++;
   if (containsProjectKeywords(text)) score++;
   if (isCommandy(text)) score++;
-  return score >= 2; // reply only on stronger signal
+  return score >= 2; // require at least 2 signals
 }
 
 // ---------- Handler ----------
@@ -173,32 +160,45 @@ export default async function handler(req, res) {
   const ACK = () => res.status(200).send('ok');
   if (!chatId) return ACK();
 
-  // ignore private chats entirely
+  // Ignore DMs entirely
   if (isPrivate) return ACK();
+
+  // Short graceful close (groups only)
+  if (RE_BYE.test((text || '').toLowerCase())) {
+    await tg('sendMessage', { chat_id: chatId, text: rnd([
+      "Anytime. Take care!",
+      "You're welcome. Have a good one!",
+      "Glad to help. See you!"
+    ]), reply_to_message_id: msg.message_id });
+    return ACK();
+  }
 
   const lower = (text || '').toLowerCase();
 
-  // graceful short-close (groups only)
-  if (RE_BYE.test(lower)) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd(BYE_LINES), reply_to_message_id: msg.message_id });
-    return ACK();
-  }
-
-  // Gwoolly / Gwolly / Gwooly → randomized Gwoolly response (sometimes with 🥚 or 🧶)
-  if (RE_GWOOL.test(lower)) {
+  // ---- MUST-REPLY (no tag) triggers:
+  if (RE_GWOOLLY.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg.message_id });
     return ACK();
   }
+  if (RE_TWITTER.test(lower)) {
+    await tg('sendMessage', { chat_id: chatId, text: rnd(TWITTER_LINES), reply_to_message_id: msg.message_id });
+    return ACK();
+  }
+  if (RE_SNAPSHOT.test(lower)) {
+    await tg('sendMessage', { chat_id: chatId, text: rnd(SNAPSHOT_LINES), reply_to_message_id: msg.message_id });
+    return ACK();
+  }
 
-  // Group routing:
+  // Group routing: mention/reply or passive heuristics
   let pass = true;
   if (isGroup) {
-    const mentioned   = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
-    const replyToBot  = msg?.reply_to_message?.from?.is_bot &&
+    const mentioned  = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
+    const replyToBot = msg?.reply_to_message?.from?.is_bot &&
       (!msg?.reply_to_message?.from?.username ||
        msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME);
-
-    if (!mentioned && !replyToBot) pass = shouldReplyPassive(text); // for Privacy OFF
+    if (!mentioned && !replyToBot) {
+      pass = shouldReplyPassive(text); // for Privacy OFF case
+    }
   }
   if (!pass) return ACK();
 
@@ -220,7 +220,7 @@ export default async function handler(req, res) {
   }
 
   if (!text) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd(CLARIFY_LINES), reply_to_message_id: msg.message_id });
+    await tg('sendMessage', { chat_id: chatId, text: "What do you need?", reply_to_message_id: msg.message_id });
     return ACK();
   }
 
@@ -232,7 +232,7 @@ export default async function handler(req, res) {
     return ACK();
   }
 
-  // LLM path with short timeout (serverless friendly)
+  // LLM path (short timeout; serverless friendly)
   try {
     const ctrl = new AbortController();
     const to = setTimeout(() => ctrl.abort(), 9000);
