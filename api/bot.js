@@ -1,10 +1,10 @@
 // /api/bot.js — Telegram webhook on Vercel (Node serverless, NO Express)
-// Env: TELEGRAM_TOKEN (or BOT_TOKEN), OPENAI_API_KEY, MODEL_ID (e.g., gpt-4o-mini),
+// Env: TELEGRAM_TOKEN (or BOT_TOKEN), OPENAI_API_KEY, MODEL_ID (e.g., gpt-5-mini),
 // optional SYSTEM_PROMPT, BOT_USERNAME
 
 const TG_TOKEN     = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN;
 const OPENAI_KEY   = process.env.OPENAI_API_KEY;
-const MODEL_ID     = process.env.MODEL_ID || 'gpt-4o-mini';
+const MODEL_ID     = process.env.MODEL_ID || 'gpt-5-mini';
 const BOT_USERNAME = (process.env.BOT_USERNAME || '').toLowerCase(); // e.g. "jarviseggsbot"
 
 const CONTRACT_ADDR = '0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7';
@@ -25,6 +25,30 @@ async function tg(method, payload) {
       log('TG error', method, r.status, t);
     }
   } catch (e) { log('TG fetch error', method, String(e?.message || e)); }
+}
+
+function isDirectMention(msg) {
+  const text = (msg?.text ?? msg?.caption ?? '') + '';
+  const lower = text.toLowerCase();
+  const envUser = (process.env.BOT_USERNAME || '').toLowerCase();
+  if (!envUser) return false;
+
+  const ents = Array.isArray(msg?.entities) ? msg.entities
+             : Array.isArray(msg?.caption_entities) ? msg.caption_entities : [];
+  for (const e of ents) {
+    if (e?.type === 'mention') {
+      const mention = text.slice(e.offset, e.offset + e.length).toLowerCase(); // "@jarviseggsbot"
+      if (mention === '@' + envUser) return true;
+    }
+  }
+  if (lower.includes('@' + envUser)) return true;
+  return false;
+}
+function stripMentionsAndName(text, botUser='') {
+  let out = text || '';
+  if (botUser) out = out.replace(new RegExp(`@${botUser}`, 'ig'), '');
+  out = out.replace(/jarvis/ig, '');
+  return out.trim();
 }
 
 // ------------ canned replies (EN only) ------------
@@ -104,11 +128,11 @@ function buildPrompt(userText) {
   const enforceEN = "Always respond in English. Do not switch languages, even if the user writes in another language.";
   return `System: ${systemPrompt()}\n${enforceEN}\nUser: ${userText}\nAssistant:`;
 }
-async function askLLM(text, signal) {
+async function askLLM(text, signal, maxTokens=220) {
   const r = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${OPENAI_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: MODEL_ID, input: buildPrompt(text), max_output_tokens: 220 }),
+    body: JSON.stringify({ model: MODEL_ID, input: buildPrompt(text), max_output_tokens: maxTokens }),
     signal
   });
   if (!r.ok) {
@@ -147,7 +171,7 @@ function shouldReplyPassive(text) {
   return score >= 2;
 }
 
-// ------------ core processing ------------
+// ------------ background processing for non-mention messages ------------
 async function processUpdate(update) {
   const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
   const chatId   = msg?.chat?.id;
@@ -177,47 +201,6 @@ async function processUpdate(update) {
 
   const lower = (text || '').toLowerCase();
 
-  // ---- DIRECT MENTION / NAME → immediate LLM (no triggers)
-  const mentioned  = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
-  const nameCalled = RE_JARVIS.test(lower);
-  if (mentioned || nameCalled) {
-    // If it looks like a greeting, reply with greet and stop
-    if (RE_GREET.test(lower)) {
-      await tg('sendMessage', { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg.message_id });
-      return;
-    }
-
-    const cleaned = (text || '')
-      .replace(new RegExp(`@${BOT_USERNAME}`, 'ig'), '')
-      .replace(/jarvis/ig, '')
-      .trim();
-
-    if (!OPENAI_KEY) {
-      await tg('sendMessage', { chat_id: chatId, text: "OpenAI API key is missing on the server." });
-      return;
-    }
-
-    tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(()=>{});
-
-    try {
-      const ctrl = new AbortController();
-      const to = setTimeout(() => ctrl.abort(), 7000); // shorter to avoid TG webhook timeout issues
-      let reply;
-      try { reply = await askLLM(cleaned || "Please greet briefly and ask how you can help.", ctrl.signal); }
-      finally { clearTimeout(to); }
-      await tg('sendMessage', { chat_id: chatId, text: reply, reply_to_message_id: msg.message_id });
-    } catch (e) {
-      const m = String(e?.message || e || 'unknown error');
-      const friendly =
-        m.includes('429') ? 'Oops: API quota exceeded. Check Billing.' :
-        m.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-4o-mini).' :
-        m.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
-        `Oops: ${m}`;
-      await tg('sendMessage', { chat_id: chatId, text: friendly, reply_to_message_id: msg.message_id });
-    }
-    return;
-  }
-
   // ---- MUST-REPLY (no tag) quick triggers
   if (RE_GWOOLLY.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg.message_id });
@@ -238,9 +221,7 @@ async function processUpdate(update) {
     const replyToBot = msg?.reply_to_message?.from?.is_bot &&
       (!msg?.reply_to_message?.from?.username ||
        msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME);
-    if (!replyToBot) {
-      pass = shouldReplyPassive(text);
-    }
+    if (!replyToBot) pass = shouldReplyPassive(text);
   }
   if (!pass) return;
 
@@ -276,41 +257,89 @@ async function processUpdate(update) {
 
   try {
     const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 7000);
+    const to = setTimeout(() => ctrl.abort(), 7000); // <= 7s “background”
     let reply;
-    try { reply = await askLLM(text, ctrl.signal); }
+    try { reply = await askLLM(text, ctrl.signal, 180); }
     finally { clearTimeout(to); }
     await tg('sendMessage', { chat_id: chatId, text: reply, reply_to_message_id: msg.message_id });
   } catch (e) {
     const m = String(e?.message || e || 'unknown error');
     const friendly =
       m.includes('429') ? 'Oops: API quota exceeded. Check Billing.' :
-      m.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-4o-mini).' :
+      m.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-5-mini).' :
       m.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
       `Oops: ${m}`;
     await tg('sendMessage', { chat_id: chatId, text: friendly, reply_to_message_id: msg.message_id });
   }
 }
 
-// ------------ webhook handler with EARLY ACK ------------
+// ------------ webhook handler: SYNC on mention, EARLY ACK otherwise ------------
 export default async function handler(req, res) {
   if (req.method === 'GET') return res.status(200).send('ok');
   if (req.method !== 'POST') return res.status(200).send('ok');
   if (!TG_TOKEN) return res.status(200).send('ok');
 
-  // read raw body
   let body = '';
   await new Promise(resolve => { req.on('data', c => body += c); req.on('end', resolve); });
   let update = {};
   try { update = body ? JSON.parse(body) : {}; } catch {}
 
-  // 1) ACK IMMEDIATELY so Telegram won't retry/stop delivering
-  res.status(200).end('ok');
+  const msg    = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
+  const chatId = msg?.chat?.id;
+  const text   = (msg?.text ?? msg?.caption ?? '').trim();
+  const chatType = msg?.chat?.type;
+  const isPrivate = chatType === 'private';
 
-  // 2) Process update "in background" (same invocation)
+  if (!chatId) { res.status(200).send('ok'); return; }
+  if (isPrivate) { res.status(200).send('ok'); return; } // ignore DMs
+
+  // --- mention/name path: handle synchronously to avoid webhook retry/lag
+  const mentioned = isDirectMention(msg) || RE_JARVIS.test(text || '');
+  if (mentioned) {
+    try {
+      const lower = (text || '').toLowerCase();
+
+      if (RE_GREET.test(lower)) {
+        await tg('sendMessage', { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg.message_id });
+        res.status(200).send('ok');
+        return;
+      }
+
+      if (!OPENAI_KEY) {
+        await tg('sendMessage', { chat_id: chatId, text: "OpenAI API key is missing on the server." });
+        res.status(200).send('ok');
+        return;
+      }
+
+      const cleaned = stripMentionsAndName(text, (process.env.BOT_USERNAME || '').toLowerCase());
+      tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(()=>{});
+
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), 3500); // <= 3.5s for snappy mention replies
+      let reply;
+      try { reply = await askLLM(cleaned || "Please answer briefly.", ctrl.signal, 150); }
+      finally { clearTimeout(to); }
+
+      if (!reply || !reply.trim()) reply = "Got it.";
+      await tg('sendMessage', { chat_id: chatId, text: reply, reply_to_message_id: msg.message_id });
+      res.status(200).send('ok');
+      return;
+    } catch (e) {
+      const m = String(e?.message || e || 'unknown error');
+      const friendly =
+        m.includes('429') ? 'Oops: API quota exceeded. Check Billing.' :
+        m.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-5-mini).' :
+        m.toLowerCase().includes('abort') ? 'Timed out. Please re-ask briefly.' :
+        `Oops: ${m}`;
+      await tg('sendMessage', { chat_id: chatId, text: friendly, reply_to_message_id: msg?.message_id });
+      res.status(200).send('ok');
+      return;
+    }
+  }
+
+  // --- non-mention: early ACK, then process “in background”
+  res.status(200).end('ok');
   try {
     await processUpdate(update);
-  } catch (e) {
-    log('processUpdate error', String(e?.message || e));
-  }
+  } catch (e) { log('processUpdate error', String(e?.message || e)); }
 }
