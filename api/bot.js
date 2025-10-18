@@ -45,10 +45,40 @@ async function tgJson(method, payload) {
   }
 }
 
+// Helper: send into the same forum topic if present
+function withThread(payload, msg) {
+  if (msg?.message_thread_id) {
+    return { message_thread_id: msg.message_thread_id, ...payload };
+  }
+  return payload;
+}
+async function sendMessageInThread(msg, text, extra = {}) {
+  return tg('sendMessage', withThread({
+    chat_id: msg.chat.id,
+    text,
+    reply_to_message_id: msg.message_id,
+    ...extra
+  }, msg));
+}
+async function sendTypingInThread(msg) {
+  return tg('sendChatAction', withThread({
+    chat_id: msg.chat.id,
+    action: 'typing'
+  }, msg));
+}
+async function sendPlaceholderInThread(msg, text = 'On it…') {
+  return tgJson('sendMessage', withThread({
+    chat_id: msg.chat.id,
+    text,
+    reply_to_message_id: msg.message_id
+  }, msg));
+}
+
+// Mentions
 function isDirectMention(msg) {
   const text = (msg?.text ?? msg?.caption ?? '') + '';
   const lower = text.toLowerCase();
-  const envUser = (process.env.BOT_USERNAME || '').toLowerCase();
+  const envUser = BOT_USERNAME;
   if (!envUser) return false;
 
   const ents = Array.isArray(msg?.entities) ? msg.entities
@@ -139,8 +169,8 @@ Rules:
 - If asked about whitelist: guaranteed whitelist requires 5 Woolly Eggs NFTs (contract: ${CONTRACT_ADDR}).
 - If asked about the Telegram WE role: it requires 10 Syndicate NFTs.
 - If user asks about earning a bit of WOOL, suggest the mini-game: https://wooligotchi.vercel.app/
-`;
-  return base.trim();
+`.trim();
+  return base;
 }
 function buildPrompt(userText) {
   const enforceEN = "Always respond in English. Do not switch languages, even if the user writes in another language.";
@@ -194,7 +224,7 @@ async function processUpdate(update) {
   const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
   const chatId   = msg?.chat?.id;
   const textRaw  = (msg?.text ?? msg?.caption ?? '');
-  const text     = textRaw.trim();
+  const text     = (textRaw || '').trim();
   const chatType = msg?.chat?.type; // private | group | supergroup | channel
   const isGroup  = chatType === 'group' || chatType === 'supergroup';
   const isPrivate= chatType === 'private';
@@ -204,11 +234,11 @@ async function processUpdate(update) {
   if (msg?.from?.is_bot) return;  // ignore bots/self
 
   if (RE_BYE.test((text || '').toLowerCase())) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd([
+    await sendMessageInThread(msg, rnd([
       "Anytime. Take care!",
       "You're welcome. Have a good one!",
       "Glad to help. See you!"
-    ]), reply_to_message_id: msg.message_id });
+    ]));
     return;
   }
 
@@ -216,15 +246,15 @@ async function processUpdate(update) {
 
   // MUST-REPLY triggers (no tag)
   if (RE_GWOOLLY.test(lower)) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg.message_id });
+    await sendMessageInThread(msg, rnd(GWOOLLY_LINES));
     return;
   }
   if (RE_TWITTER.test(lower)) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd(TWITTER_LINES), reply_to_message_id: msg.message_id });
+    await sendMessageInThread(msg, rnd(TWITTER_LINES));
     return;
   }
   if (RE_SNAPSHOT.test(lower)) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd(SNAPSHOT_LINES), reply_to_message_id: msg.message_id });
+    await sendMessageInThread(msg, rnd(SNAPSHOT_LINES));
     return;
   }
 
@@ -240,33 +270,33 @@ async function processUpdate(update) {
 
   // CANNED answers
   if (RE_WL.test(lower)) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd(WL_LINES), reply_to_message_id: msg.message_id });
+    await sendMessageInThread(msg, rnd(WL_LINES));
     if (RE_GAME.test(lower)) {
-      await tg('sendMessage', { chat_id: chatId, text: rnd(GAME_LINES), reply_to_message_id: msg.message_id });
+      await sendMessageInThread(msg, rnd(GAME_LINES));
     }
     return;
   }
   if (RE_WE.test(lower) || (RE_WE.test(lower) && RE_SYN.test(lower))) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd(WE_ROLE_LINES), reply_to_message_id: msg.message_id });
+    await sendMessageInThread(msg, rnd(WE_ROLE_LINES));
     return;
   }
   if (RE_GAME.test(lower)) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd(GAME_LINES), reply_to_message_id: msg.message_id });
+    await sendMessageInThread(msg, rnd(GAME_LINES));
     return;
   }
 
   if (!text) {
-    await tg('sendMessage', { chat_id: chatId, text: "What do you need?", reply_to_message_id: msg.message_id });
+    await sendMessageInThread(msg, "What do you need?");
     return;
   }
 
   // LLM fallback (background)
   if (!OPENAI_KEY) {
-    await tg('sendMessage', { chat_id: chatId, text: "OpenAI API key is missing on the server." });
+    await sendMessageInThread(msg, "OpenAI API key is missing on the server.");
     return;
   }
 
-  tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(()=>{});
+  sendTypingInThread(msg).catch(()=>{});
 
   try {
     const ctrl = new AbortController();
@@ -274,7 +304,7 @@ async function processUpdate(update) {
     let reply;
     try { reply = await askLLM(text, ctrl.signal, 180); }
     finally { clearTimeout(to); }
-    await tg('sendMessage', { chat_id: chatId, text: reply, reply_to_message_id: msg.message_id });
+    await sendMessageInThread(msg, reply);
   } catch (e) {
     const m = String(e?.message || e || 'unknown error');
     const friendly =
@@ -282,29 +312,35 @@ async function processUpdate(update) {
       m.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-5-mini).' :
       m.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
       `Oops: ${m}`;
-    await tg('sendMessage', { chat_id: chatId, text: friendly, reply_to_message_id: msg.message_id });
+    await sendMessageInThread(msg, friendly);
   }
 }
 
-// ------------ webhook handler: ALWAYS EARLY ACK; mentions get placeholder + edit ------------
+// ------------ webhook handler: EARLY ACK; mentions get placeholder + edit ------------
 export default async function handler(req, res) {
   if (req.method === 'GET') return res.status(200).send('ok');
   if (req.method !== 'POST') return res.status(200).send('ok');
   if (!TG_TOKEN) return res.status(200).send('ok');
 
-  let body = '';
-  await new Promise(resolve => { req.on('data', c => body += c); req.on('end', resolve); });
+  // Prefer req.body if Next.js already parsed it; otherwise read the stream
   let update = {};
-  try { update = body ? JSON.parse(body) : {}; } catch {}
+  if (req.body && typeof req.body === 'object') {
+    update = req.body;
+  } else {
+    let body = '';
+    await new Promise(resolve => { req.on('data', c => body += c); req.on('end', resolve); });
+    try { update = body ? JSON.parse(body) : {}; } catch {}
+  }
 
   // 1) ACK immediately
   res.status(200).end('ok');
 
   // 2) Process
   try {
-    const msg    = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
-    const chatId = msg?.chat?.id;
-    const text   = (msg?.text ?? msg?.caption ?? '').trim();
+    const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
+    const chatId   = msg?.chat?.id;
+    const textRaw  = (msg?.text ?? msg?.caption ?? '');
+    const text     = (textRaw || '').trim();
     const chatType = msg?.chat?.type;
     const isPrivate = chatType === 'private';
     if (!chatId || isPrivate || msg?.from?.is_bot) return;
@@ -316,43 +352,39 @@ export default async function handler(req, res) {
 
       // Greeting path -> quick greet, done
       if (RE_GREET.test(lower)) {
-        await tg('sendMessage', { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg.message_id });
+        await sendMessageInThread(msg, rnd(GREET_LINES));
         return;
       }
 
       // Placeholder → then edit to final
       let mid = null;
       try {
-        const ph = await tgJson('sendMessage', {
-          chat_id: chatId,
-          text: "On it…",
-          reply_to_message_id: msg.message_id
-        });
+        const ph = await sendPlaceholderInThread(msg, "On it…");
         mid = ph?.result?.message_id || null;
-      } catch (e) {
+      } catch {
         // ignore; we can still send a fresh message later
       }
 
       if (!OPENAI_KEY) {
-        await tg('sendMessage', { chat_id: chatId, text: "OpenAI API key is missing on the server." });
+        await sendMessageInThread(msg, "OpenAI API key is missing on the server.");
         return;
       }
 
-      const cleaned = stripMentionsAndName(text, (process.env.BOT_USERNAME || '').toLowerCase());
-      tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(()=>{});
+      const cleaned = stripMentionsAndName(text, BOT_USERNAME);
+      sendTypingInThread(msg).catch(()=>{});
 
       try {
         const ctrl = new AbortController();
-        const to = setTimeout(() => ctrl.abort(), 9000); // 9s in background (safe, we already ACKed)
+        const to = setTimeout(() => ctrl.abort(), 9000); // 9s background (safe, we already ACKed)
         let reply;
         try { reply = await askLLM(cleaned || "Please answer briefly.", ctrl.signal, 160); }
         finally { clearTimeout(to); }
 
         if (!reply || !reply.trim()) reply = "Got it.";
         if (mid) {
-          await tg('editMessageText', { chat_id: chatId, message_id: mid, text: reply });
+          await tg('editMessageText', { chat_id: msg.chat.id, message_id: mid, text: reply });
         } else {
-          await tg('sendMessage', { chat_id: chatId, text: reply, reply_to_message_id: msg.message_id });
+          await sendMessageInThread(msg, reply);
         }
       } catch (e) {
         const m = String(e?.message || e || 'unknown error');
@@ -362,9 +394,9 @@ export default async function handler(req, res) {
           m.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
           `Oops: ${m}`;
         if (mid) {
-          await tg('editMessageText', { chat_id: chatId, message_id: mid, text: friendly });
+          await tg('editMessageText', { chat_id: msg.chat.id, message_id: mid, text: friendly });
         } else {
-          await tg('sendMessage', { chat_id: chatId, text: friendly, reply_to_message_id: msg.message_id });
+          await sendMessageInThread(msg, friendly);
         }
       }
       return;
@@ -376,3 +408,11 @@ export default async function handler(req, res) {
     log('processUpdate error', String(e?.message || e));
   }
 }
+
+// If you read the stream manually in Next.js, disable its bodyParser in next.config or per-route.
+// But since we first try req.body above, extra config is optional here.
+export const config = {
+  api: {
+    bodyParser: true
+  }
+};
