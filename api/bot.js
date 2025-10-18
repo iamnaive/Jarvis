@@ -1,80 +1,138 @@
 // /api/bot.js — Telegram webhook on Vercel (Node serverless, NO Express)
 // Env: TELEGRAM_TOKEN (or BOT_TOKEN), OPENAI_API_KEY, MODEL_ID (e.g., gpt-5-mini),
 // optional SYSTEM_PROMPT, BOT_USERNAME
+// Comments: English only.
 
 const TG_TOKEN     = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN;
 const OPENAI_KEY   = process.env.OPENAI_API_KEY;
-const MODEL_ID     = process.env.MODEL_ID || 'gpt-5-mini';
+const MODEL_ID     = process.env.MODEL_ID || 'gpt-5-mini'; // <-- Default model here
 const BOT_USERNAME = (process.env.BOT_USERNAME || '').toLowerCase(); // e.g. "jarviseggsbot"
 
 const CONTRACT_ADDR = '0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7';
 
-// ------------ utils ------------
+// ---------- Utils ----------
 const rnd = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const log = (...a) => { try { console.log(...a); } catch {} };
 
-// fire-and-forget call
+// Thread helper: keep replies inside forum topics (supergroup threads)
+function withThread(payload, msg) {
+  return msg?.message_thread_id
+    ? { message_thread_id: msg.message_thread_id, ...payload }
+    : payload;
+}
+
+// Fire-and-forget Telegram call
 async function tg(method, payload) {
   try {
     const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
     });
     if (!r.ok) {
-      const t = await r.text().catch(()=> '');
+      const t = await r.text().catch(() => '');
       log('TG error', method, r.status, t);
     }
-  } catch (e) { log('TG fetch error', method, String(e?.message || e)); }
+  } catch (e) {
+    log('TG fetch error', method, String(e?.message || e));
+  }
 }
 
-// call that RETURNS JSON (we need message_id to edit later)
+// JSON-returning Telegram call (for placeholder edit etc.)
 async function tgJson(method, payload) {
   const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
   });
   const txt = await r.text();
   if (!r.ok) {
     log('TG json error', method, r.status, txt);
     throw new Error(`TG ${method} ${r.status}`);
   }
-  try { return JSON.parse(txt); } catch {
-    return { ok:false, raw: txt };
-  }
+  try { return JSON.parse(txt); } catch { return { ok: false, raw: txt }; }
 }
 
-// Helper: send into the same forum topic if present
-function withThread(payload, msg) {
-  if (msg?.message_thread_id) {
-    return { message_thread_id: msg.message_thread_id, ...payload };
-  }
-  return payload;
-}
+// Convenience wrappers (thread-aware)
 async function sendMessageInThread(msg, text, extra = {}) {
   return tg('sendMessage', withThread({
     chat_id: msg.chat.id,
     text,
     reply_to_message_id: msg.message_id,
-    ...extra
+    ...extra,
   }, msg));
 }
 async function sendTypingInThread(msg) {
   return tg('sendChatAction', withThread({
     chat_id: msg.chat.id,
-    action: 'typing'
+    action: 'typing',
   }, msg));
 }
 async function sendPlaceholderInThread(msg, text = 'On it…') {
   return tgJson('sendMessage', withThread({
     chat_id: msg.chat.id,
     text,
-    reply_to_message_id: msg.message_id
+    reply_to_message_id: msg.message_id,
   }, msg));
 }
 
-// Mentions
+// ---------- Canned replies (EN only) ----------
+const WL_LINES = [
+  `Guaranteed whitelist = 5 Woolly Eggs NFTs. Contract: ${CONTRACT_ADDR}`,
+  `Hold 5 Woolly Eggs — you’re guaranteed on the whitelist. Contract: ${CONTRACT_ADDR}`,
+  `Whitelist is guaranteed when you hold 5 Woolly Eggs NFTs. Contract: ${CONTRACT_ADDR}`,
+  `With 5 Woolly Eggs you’re auto-whitelisted. Contract: ${CONTRACT_ADDR}`,
+];
+const WE_ROLE_LINES = [
+  "The Telegram WE role requires 10 Syndicate NFTs.",
+  "To get the WE role in Telegram, hold 10 Syndicate NFTs.",
+  "WE role → hold 10 Syndicate NFTs (Telegram).",
+  "You’ll receive the WE Telegram role once you hold 10 Syndicate NFTs.",
+];
+const GAME_LINES = [
+  "Want to earn some WOOL? Try the mini-game: https://wooligotchi.vercel.app/",
+  "You can grind a bit of WOOL here: https://wooligotchi.vercel.app/",
+  "Small WOOL boost: play https://wooligotchi.vercel.app/",
+  "For a little WOOL, check: https://wooligotchi.vercel.app/",
+];
+const GWOOLLY_LINES = [
+  "Ping — I’m here. How can I help?",
+  "Hey! Need anything about Woolly Eggs?",
+  "Here and listening. What do you need?",
+  "Hi there — what can I do for you?",
+];
+const TWITTER_LINES = [
+  "Official X (Twitter): https://x.com/WoollyEggs",
+  "You can follow us on X here: https://x.com/WoollyEggs",
+  "Our X (Twitter) page: https://x.com/WoollyEggs",
+  "X link: https://x.com/WoollyEggs",
+];
+const SNAPSHOT_LINES = [
+  "The snapshot will occur one day before the mainnet launch.",
+  "Snapshot is planned for 24 hours prior to mainnet going live.",
+  "Expect the snapshot a day ahead of the mainnet launch.",
+  "Snapshot happens one day before mainnet.",
+];
+const GREET_LINES = [
+  "Hey — Jarvis here. How can I help?",
+  "Hi there, I’m Jarvis. What do you need?",
+  "Hello! Jarvis on the line — how can I assist?",
+  "Hey! Jarvis here. Ask away.",
+];
+
+// ---------- Regex triggers (EN only) ----------
+const RE_WL       = /\b(whitelist|allowlist)\b/i;
+const RE_WE       = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
+const RE_SYN      = /\b(syndicate)\b/i;
+const RE_GAME     = /\b(wooligotchi|wooli?gotchi|mini-?game|game|wool)\b/i;
+const RE_BYE      = /^(thanks|thank you|ok|okay|got it|all good|bye|goodbye)$/i;
+const RE_GWOOLLY  = /\bgwoolly\b/i;
+const RE_TWITTER  = /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/i;
+const RE_SNAPSHOT = /\b(snapshot)\b/i;
+const RE_JARVIS   = /\bjarvis\b/i;
+const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*evening|good\s*night|sup|what'?s\s*up)\b/i;
+
+// ---------- Mention helpers ----------
 function isDirectMention(msg) {
   const text = (msg?.text ?? msg?.caption ?? '') + '';
   const lower = text.toLowerCase();
@@ -82,7 +140,7 @@ function isDirectMention(msg) {
   if (!envUser) return false;
 
   const ents = Array.isArray(msg?.entities) ? msg.entities
-             : Array.isArray(msg?.caption_entities) ? msg.caption_entities : [];
+              : Array.isArray(msg?.caption_entities) ? msg.caption_entities : [];
   for (const e of ents) {
     if (e?.type === 'mention') {
       const mention = text.slice(e.offset, e.offset + e.length).toLowerCase(); // "@jarviseggsbot"
@@ -99,63 +157,7 @@ function stripMentionsAndName(text, botUser='') {
   return out.trim();
 }
 
-// ------------ canned replies (EN only) ------------
-const WL_LINES = [
-  `Guaranteed whitelist = 5 Woolly Eggs NFTs. Contract: ${CONTRACT_ADDR}`,
-  `Hold 5 Woolly Eggs — you’re guaranteed on the whitelist. Contract: ${CONTRACT_ADDR}`,
-  `Whitelist is guaranteed when you hold 5 Woolly Eggs NFTs. Contract: ${CONTRACT_ADDR}`,
-  `With 5 Woolly Eggs you’re auto-whitelisted. Contract: ${CONTRACT_ADDR}`
-];
-const WE_ROLE_LINES = [
-  "The Telegram WE role requires 10 Syndicate NFTs.",
-  "To get the WE role in Telegram, hold 10 Syndicate NFTs.",
-  "WE role → hold 10 Syndicate NFTs (Telegram).",
-  "You’ll receive the WE Telegram role once you hold 10 Syndicate NFTs."
-];
-const GAME_LINES = [
-  "Want to earn some WOOL? Try the mini-game: https://wooligotchi.vercel.app/",
-  "You can grind a bit of WOOL here: https://wooligotchi.vercel.app/",
-  "Small WOOL boost: play https://wooligotchi.vercel.app/",
-  "For a little WOOL, check: https://wooligotchi.vercel.app/"
-];
-const GWOOLLY_LINES = [
-  "Ping — I’m here. How can I help?",
-  "Hey! Need anything about Woolly Eggs?",
-  "Here and listening. What do you need?",
-  "Hi there — what can I do for you?"
-];
-const TWITTER_LINES = [
-  "Official X (Twitter): https://x.com/WoollyEggs",
-  "You can follow us on X here: https://x.com/WoollyEggs",
-  "Our X (Twitter) page: https://x.com/WoollyEggs",
-  "X link: https://x.com/WoollyEggs"
-];
-const SNAPSHOT_LINES = [
-  "The snapshot will occur one day before the mainnet launch.",
-  "Snapshot is planned for 24 hours prior to mainnet going live.",
-  "Expect the snapshot a day ahead of the mainnet launch.",
-  "Snapshot happens one day before mainnet."
-];
-const GREET_LINES = [
-  "Hey — Jarvis here. How can I help?",
-  "Hi there, I’m Jarvis. What do you need?",
-  "Hello! Jarvis on the line — how can I assist?",
-  "Hey! Jarvis here. Ask away."
-];
-
-// ------------ regex (EN only) ------------
-const RE_WL       = /\b(whitelist|allowlist)\b/i;
-const RE_WE       = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
-const RE_SYN      = /\b(syndicate)\b/i;
-const RE_GAME     = /\b(wooligotchi|wooli?gotchi|mini-?game|game|wool)\b/i;
-const RE_BYE      = /^(thanks|thank you|ok|okay|got it|all good|bye|goodbye)$/i;
-const RE_GWOOLLY  = /\bgwoolly\b/i;
-const RE_TWITTER  = /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/i;
-const RE_SNAPSHOT = /\b(snapshot)\b/i;
-const RE_JARVIS   = /\bjarvis\b/i;
-const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*evening|good\s*night|sup|what'?s\s*up)\b/i;
-
-// ------------ LLM ------------
+// ---------- LLM ----------
 function systemPrompt() {
   const base = process.env.SYSTEM_PROMPT || `
 You are “Jarvis”, a concise, friendly assistant and a resident of the Woolly Eggs universe (NFT collection).
@@ -176,12 +178,12 @@ function buildPrompt(userText) {
   const enforceEN = "Always respond in English. Do not switch languages, even if the user writes in another language.";
   return `System: ${systemPrompt()}\n${enforceEN}\nUser: ${userText}\nAssistant:`;
 }
-async function askLLM(text, signal, maxTokens=220) {
+async function askLLM(text, signal, maxTokens = 220) {
   const r = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${OPENAI_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: MODEL_ID, input: buildPrompt(text), max_output_tokens: maxTokens }),
-    signal
+    signal,
   });
   if (!r.ok) {
     let msg = `LLM error ${r.status}`;
@@ -192,7 +194,7 @@ async function askLLM(text, signal, maxTokens=220) {
   return data.output_text ?? data.output?.[0]?.content?.[0]?.text ?? "I couldn't produce a response.";
 }
 
-// ------------ heuristics for passive replies ------------
+// ---------- Passive heuristics (EN only) ----------
 function looksLikeQuestion(txt) {
   if (!txt) return false;
   const s = txt.toLowerCase();
@@ -219,7 +221,7 @@ function shouldReplyPassive(text) {
   return score >= 2;
 }
 
-// ------------ background processing for non-mention messages ------------
+// ---------- Background processing for non-mention path ----------
 async function processUpdate(update) {
   const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
   const chatId   = msg?.chat?.id;
@@ -237,14 +239,14 @@ async function processUpdate(update) {
     await sendMessageInThread(msg, rnd([
       "Anytime. Take care!",
       "You're welcome. Have a good one!",
-      "Glad to help. See you!"
+      "Glad to help. See you!",
     ]));
     return;
   }
 
   const lower = (text || '').toLowerCase();
 
-  // MUST-REPLY triggers (no tag)
+  // Must-reply triggers (no tag)
   if (RE_GWOOLLY.test(lower)) {
     await sendMessageInThread(msg, rnd(GWOOLLY_LINES));
     return;
@@ -268,7 +270,7 @@ async function processUpdate(update) {
   }
   if (!pass) return;
 
-  // CANNED answers
+  // Canned answers
   if (RE_WL.test(lower)) {
     await sendMessageInThread(msg, rnd(WL_LINES));
     if (RE_GAME.test(lower)) {
@@ -290,7 +292,7 @@ async function processUpdate(update) {
     return;
   }
 
-  // LLM fallback (background)
+  // LLM fallback
   if (!OPENAI_KEY) {
     await sendMessageInThread(msg, "OpenAI API key is missing on the server.");
     return;
@@ -300,7 +302,7 @@ async function processUpdate(update) {
 
   try {
     const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 9000); // 9s background
+    const to = setTimeout(() => ctrl.abort(), 9000); // 9s serverless-friendly
     let reply;
     try { reply = await askLLM(text, ctrl.signal, 180); }
     finally { clearTimeout(to); }
@@ -316,13 +318,13 @@ async function processUpdate(update) {
   }
 }
 
-// ------------ webhook handler: EARLY ACK; mentions get placeholder + edit ------------
+// ---------- Webhook handler ----------
 export default async function handler(req, res) {
   if (req.method === 'GET') return res.status(200).send('ok');
   if (req.method !== 'POST') return res.status(200).send('ok');
   if (!TG_TOKEN) return res.status(200).send('ok');
 
-  // Prefer req.body if Next.js already parsed it; otherwise read the stream
+  // Prefer Next/Vercel parsed body if available
   let update = {};
   if (req.body && typeof req.body === 'object') {
     update = req.body;
@@ -332,10 +334,10 @@ export default async function handler(req, res) {
     try { update = body ? JSON.parse(body) : {}; } catch {}
   }
 
-  // 1) ACK immediately
+  // Early ACK
   res.status(200).end('ok');
 
-  // 2) Process
+  // Process in background
   try {
     const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
     const chatId   = msg?.chat?.id;
@@ -345,44 +347,37 @@ export default async function handler(req, res) {
     const isPrivate = chatType === 'private';
     if (!chatId || isPrivate || msg?.from?.is_bot) return;
 
-    const mentioned = isDirectMention(msg) || RE_JARVIS.test(text || '');
+    const lower = (text || '').toLowerCase();
+    const mentioned  = isDirectMention(msg);
+    const nameCalled = RE_JARVIS.test(lower);
 
-    if (mentioned) {
-      const lower = (text || '').toLowerCase();
+    // If greeted explicitly when mentioned or by name -> quick greet
+    if ((mentioned || nameCalled) && RE_GREET.test(lower)) {
+      await sendMessageInThread(msg, rnd(GREET_LINES));
+      return;
+    }
 
-      // Greeting path -> quick greet, done
-      if (RE_GREET.test(lower)) {
-        await sendMessageInThread(msg, rnd(GREET_LINES));
-        return;
-      }
-
-      // Placeholder → then edit to final
+    // Mention/name path -> placeholder then LLM (edited)
+    if (mentioned || nameCalled) {
       let mid = null;
       try {
         const ph = await sendPlaceholderInThread(msg, "On it…");
         mid = ph?.result?.message_id || null;
-      } catch {
-        // ignore; we can still send a fresh message later
-      }
-
+      } catch {}
       if (!OPENAI_KEY) {
         await sendMessageInThread(msg, "OpenAI API key is missing on the server.");
         return;
       }
-
-      const cleaned = stripMentionsAndName(text, BOT_USERNAME);
       sendTypingInThread(msg).catch(()=>{});
-
       try {
         const ctrl = new AbortController();
-        const to = setTimeout(() => ctrl.abort(), 9000); // 9s background (safe, we already ACKed)
+        const to = setTimeout(() => ctrl.abort(), 9000);
         let reply;
-        try { reply = await askLLM(cleaned || "Please answer briefly.", ctrl.signal, 160); }
+        try { reply = await askLLM(stripMentionsAndName(text, BOT_USERNAME) || "Please answer briefly.", ctrl.signal, 160); }
         finally { clearTimeout(to); }
-
         if (!reply || !reply.trim()) reply = "Got it.";
         if (mid) {
-          await tg('editMessageText', { chat_id: msg.chat.id, message_id: mid, text: reply });
+          await tg('editMessageText', withThread({ chat_id: msg.chat.id, message_id: mid, text: reply }, msg));
         } else {
           await sendMessageInThread(msg, reply);
         }
@@ -394,7 +389,7 @@ export default async function handler(req, res) {
           m.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
           `Oops: ${m}`;
         if (mid) {
-          await tg('editMessageText', { chat_id: msg.chat.id, message_id: mid, text: friendly });
+          await tg('editMessageText', withThread({ chat_id: msg.chat.id, message_id: mid, text: friendly }, msg));
         } else {
           await sendMessageInThread(msg, friendly);
         }
@@ -402,17 +397,16 @@ export default async function handler(req, res) {
       return;
     }
 
-    // Non-mention path uses background processor (triggers/heuristics/LLM)
+    // Non-mention path (triggers/heuristics/LLM)
     await processUpdate(update);
   } catch (e) {
     log('processUpdate error', String(e?.message || e));
   }
 }
 
-// If you read the stream manually in Next.js, disable its bodyParser in next.config or per-route.
-// But since we first try req.body above, extra config is optional here.
+// If Next.js parses the body, keeping bodyParser enabled is fine because we prefer req.body first.
 export const config = {
   api: {
-    bodyParser: true
-  }
+    bodyParser: true,
+  },
 };
