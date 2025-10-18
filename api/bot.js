@@ -1,32 +1,58 @@
 // /api/bot.js — Telegram webhook on Vercel (Node serverless, NO Express)
 // Env: TELEGRAM_TOKEN (or BOT_TOKEN), OPENAI_API_KEY, MODEL_ID (e.g., gpt-4o-mini), optional SYSTEM_PROMPT, BOT_USERNAME
 
-const TG_TOKEN   = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN;
-const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const MODEL_ID   = process.env.MODEL_ID || 'gpt-4o-mini';
+const TG_TOKEN     = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN;
+const OPENAI_KEY   = process.env.OPENAI_API_KEY;
+const MODEL_ID     = process.env.MODEL_ID || 'gpt-4o-mini';
 const BOT_USERNAME = (process.env.BOT_USERNAME || '').toLowerCase(); // e.g. "jarviseggsbot"
 
 const rnd = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const log = (...a) => { try { console.log(...a); } catch {} };
 
-// ---------- Quick canned replies (EN only) ----------
+// ---------- CANNED REPLIES (EN only, with multiple phrasings) ----------
 const WL_LINES = [
   "Guaranteed whitelist = **5** Woolly Eggs NFTs.",
   "Hold **5** Woolly Eggs → you’re guaranteed on the whitelist.",
   "Whitelist is guaranteed when you hold **5** Woolly Eggs NFTs.",
-  "With **5** Woolly Eggs you’re auto-whitelisted."
+  "With **5** Woolly Eggs you’re auto-whitelisted.",
+  "Holding **5** Woolly Eggs secures a guaranteed whitelist spot.",
+  "**5** Woolly Eggs in your wallet = guaranteed whitelist.",
+  "Guarantee your whitelist by holding **5** Woolly Eggs NFTs."
 ];
+
 const WE_ROLE_LINES = [
   "The Telegram **WE** role requires **10** Syndicate NFTs.",
   "To get the **WE** role in Telegram, hold **10** Syndicate NFTs.",
   "**WE** role → hold **10** Syndicate NFTs (Telegram).",
-  "You’ll receive the **WE** Telegram role once you hold **10** Syndicate NFTs."
+  "You’ll receive the **WE** Telegram role once you hold **10** Syndicate NFTs.",
+  "The **WE** role on Telegram is granted when you hold **10** Syndicate NFTs.",
+  "Hold **10** Syndicate NFTs to qualify for the Telegram **WE** role.",
+  "Owning **10** Syndicate NFTs unlocks the **WE** role in Telegram."
 ];
+
 const GAME_LINES = [
   "Want to earn some WOOL? Try the mini-game: https://wooligotchi.vercel.app/",
   "You can grind a bit of WOOL here: https://wooligotchi.vercel.app/",
   "Small WOOL boost: play https://wooligotchi.vercel.app/",
-  "For a little WOOL, check: https://wooligotchi.vercel.app/"
+  "For a little WOOL, check: https://wooligotchi.vercel.app/",
+  "Earn a little WOOL by playing: https://wooligotchi.vercel.app/",
+  "Grab some WOOL in the Wooligotchi mini-game: https://wooligotchi.vercel.app/",
+  "Play Wooligotchi to farm a bit of WOOL: https://wooligotchi.vercel.app/"
+];
+
+const BYE_LINES = [
+  "Anytime. Take care!",
+  "You're welcome. Have a good one!",
+  "Glad to help. See you!",
+  "Happy to help—bye!",
+  "Cheers!",
+  "Until next time."
+];
+
+const CLARIFY_LINES = [
+  "What do you need?",
+  "How can I help?",
+  "Tell me what you’re looking for."
 ];
 
 // ---------- English-only keyword triggers ----------
@@ -112,7 +138,7 @@ function shouldReplyPassive(text) {
   if (looksLikeQuestion(text)) score++;
   if (containsProjectKeywords(text)) score++;
   if (isCommandy(text)) score++;
-  return score >= 2; // require at least 2 signals
+  return score >= 2; // reply only on stronger signal
 }
 
 // ---------- Handler ----------
@@ -137,18 +163,12 @@ export default async function handler(req, res) {
   const ACK = () => res.status(200).send('ok');
   if (!chatId) return ACK();
 
-  // >>> NEW: ignore private chats entirely <<<
-  if (isPrivate) {
-    return ACK(); // do not respond in DMs
-  }
+  // ignore private chats entirely
+  if (isPrivate) return ACK();
 
   // short graceful close (groups only)
   if (RE_BYE.test((text || '').toLowerCase())) {
-    await tg('sendMessage', { chat_id: chatId, text: rnd([
-      "Anytime. Take care!",
-      "You're welcome. Have a good one!",
-      "Glad to help. See you!"
-    ]), reply_to_message_id: msg.message_id });
+    await tg('sendMessage', { chat_id: chatId, text: rnd(BYE_LINES), reply_to_message_id: msg.message_id });
     return ACK();
   }
 
@@ -183,7 +203,7 @@ export default async function handler(req, res) {
   }
 
   if (!text) {
-    await tg('sendMessage', { chat_id: chatId, text: "What do you need?", reply_to_message_id: msg.message_id });
+    await tg('sendMessage', { chat_id: chatId, text: rnd(CLARIFY_LINES), reply_to_message_id: msg.message_id });
     return ACK();
   }
 
