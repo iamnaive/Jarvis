@@ -8,8 +8,9 @@ const MODEL_ID     = process.env.MODEL_ID || 'gpt-4o-mini'; // <-- Default LLM m
 const BOT_USERNAME = (process.env.BOT_USERNAME || '').toLowerCase(); // e.g. "jarviseggsbot"
 
 // Feature flags
-const USE_LLM_ON_MENTION = true;   // LLM only when mentioned / name called / replying to bot
-const LLM_TIMEOUT_MS      = 9000;  // serverless-friendly
+const USE_LLM_ON_MENTION = true;    // LLM only when mentioned / name called / replying to bot
+const LLM_TIMEOUT_MS      = 7000;   // tighter than serverless 10s
+const LLM_COOLDOWN_MS     = 2500;   // anti-flood per chat
 
 // Project constants
 const CONTRACT_ADDR = '0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7';
@@ -25,7 +26,7 @@ function withThread(payload, msg) {
     : payload;
 }
 
-// Telegram helpers
+// Telegram helpers — fire-and-forget by default (don't await in triggers)
 async function tg(method, payload) {
   try {
     const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
@@ -52,25 +53,20 @@ async function tgJson(method, payload) {
   }
   try { return JSON.parse(txt); } catch { return { ok:false, raw: txt }; }
 }
-async function sendMessageInThread(msg, text, extra = {}) {
-  return tg('sendMessage', withThread({
-    chat_id: msg.chat.id,
-    text,
-    reply_to_message_id: msg.message_id,
-    ...extra
+function sendMessageFast(msg, text, extra = {}) {
+  // do not await (fire-and-forget) for speed on triggers
+  void tg('sendMessage', withThread({
+    chat_id: msg.chat.id, text, reply_to_message_id: msg.message_id, ...extra
   }, msg));
 }
-async function sendTypingInThread(msg) {
-  return tg('sendChatAction', withThread({
-    chat_id: msg.chat.id,
-    action: 'typing'
+function sendTypingFast(msg) {
+  void tg('sendChatAction', withThread({
+    chat_id: msg.chat.id, action: 'typing'
   }, msg));
 }
 async function editMessageInThread(msg, message_id, text) {
   return tg('editMessageText', withThread({
-    chat_id: msg.chat.id,
-    message_id,
-    text
+    chat_id: msg.chat.id, message_id, text
   }, msg));
 }
 
@@ -94,10 +90,10 @@ const GAME_LINES = [
   "For a little WOOL, check: https://wooligotchi.vercel.app/"
 ];
 const GWOOLLY_LINES = [
-  "Ping — I’m here. How can I help?",
-  "Hey! Need anything about Woolly Eggs?",
-  "Here and listening. What do you need?",
-  "Hi there — what can I do for you?"
+  "Gwoolly",
+  "Gwoolly 🧶",
+  "Gwoolly 🥚",
+  "Gwoolly 🥚 🧶"
 ];
 const TWITTER_LINES = [
   "Official X (Twitter): https://x.com/WoollyEggs",
@@ -192,11 +188,10 @@ async function askLLM(text, signal, maxTokens=220) {
   return data.output_text ?? data.output?.[0]?.content?.[0]?.text ?? "I couldn't produce a response.";
 }
 
-// Simple anti-flood per chat for LLM
+// Anti-flood per chat for LLM
 const lastLLMAt = new Map(); // chatId -> timestamp
-const LLM_COOLDOWN_MS = 2500;
 
-// Heuristics (for passive mode)
+// Heuristics (passive)
 function looksLikeQuestion(txt) {
   if (!txt) return false;
   const s = txt.toLowerCase();
@@ -223,8 +218,8 @@ function shouldReplyPassive(text) {
   return score >= 2;
 }
 
-// Background processor for non-mention path (triggers only, no LLM)
-async function processNonMention(update) {
+// Background processor — triggers only (no LLM)
+function processNonMention(update) {
   const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
   const chatId   = msg?.chat?.id;
   const textRaw  = (msg?.text ?? msg?.caption ?? '');
@@ -238,7 +233,7 @@ async function processNonMention(update) {
   const lower = (text || '').toLowerCase();
 
   if (RE_BYE.test(lower)) {
-    await sendMessageInThread(msg, rnd([
+    sendMessageFast(msg, rnd([
       "Anytime. Take care!",
       "You're welcome. Have a good one!",
       "Glad to help. See you!"
@@ -247,9 +242,9 @@ async function processNonMention(update) {
   }
 
   // Must-reply triggers (no tag)
-  if (RE_GWOOLLY.test(lower))  return sendMessageInThread(msg, rnd(GWOOLLY_LINES));
-  if (RE_TWITTER.test(lower))  return sendMessageInThread(msg, rnd(TWITTER_LINES));
-  if (RE_SNAPSHOT.test(lower)) return sendMessageInThread(msg, rnd(SNAPSHOT_LINES));
+  if (RE_GWOOLLY.test(lower))  return void sendMessageFast(msg, rnd(GWOOLLY_LINES));
+  if (RE_TWITTER.test(lower))  return void sendMessageFast(msg, rnd(TWITTER_LINES));
+  if (RE_SNAPSHOT.test(lower)) return void sendMessageFast(msg, rnd(SNAPSHOT_LINES));
 
   // Passive heuristics gate
   let pass = true;
@@ -263,21 +258,20 @@ async function processNonMention(update) {
 
   // Canned knowledge
   if (RE_WL.test(lower)) {
-    await sendMessageInThread(msg, rnd(WL_LINES));
-    if (RE_GAME.test(lower)) await sendMessageInThread(msg, rnd(GAME_LINES));
+    sendMessageFast(msg, rnd(WL_LINES));
+    if (RE_GAME.test(lower)) sendMessageFast(msg, rnd(GAME_LINES));
     return;
   }
   if (RE_WE.test(lower) || (RE_WE.test(lower) && RE_SYN.test(lower))) {
-    await sendMessageInThread(msg, rnd(WE_ROLE_LINES));
+    sendMessageFast(msg, rnd(WE_ROLE_LINES));
     return;
   }
   if (RE_GAME.test(lower)) {
-    await sendMessageInThread(msg, rnd(GAME_LINES));
+    sendMessageFast(msg, rnd(GAME_LINES));
     return;
   }
 
-  // Fallback (still no LLM here)
-  if (!text) return sendMessageInThread(msg, "What do you need?");
+  if (!text) return void sendMessageFast(msg, "What do you need?");
 }
 
 // Webhook handler
@@ -299,14 +293,42 @@ export default async function handler(req, res) {
   // Early ACK
   res.status(200).end('ok');
 
+  // Commands (fast)
+  try {
+    const msg = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
+    if (!msg || msg?.from?.is_bot) return;
+
+    const chatId   = msg.chat?.id;
+    const text     = ((msg.text ?? msg.caption) || '').trim();
+    const lower    = text.toLowerCase();
+    const isPrivate= msg.chat?.type === 'private';
+
+    if (!chatId || isPrivate) return;
+
+    if (lower === '/ping' || lower.startsWith('/ping ')) {
+      return void sendMessageFast(msg, 'pong');
+    }
+    if (lower === '/diag' || lower.startsWith('/diag ')) {
+      const diag =
+        `ok\n` +
+        `model=${MODEL_ID}\n` +
+        `bot=@${BOT_USERNAME || 'UNKNOWN'}\n` +
+        `llm_on_mention=${USE_LLM_ON_MENTION}\n` +
+        `openai_key=${OPENAI_KEY ? 'SET' : 'MISSING'}\n` +
+        `thread=${msg.message_thread_id ? 'yes' : 'no'}\n`;
+      return void sendMessageFast(msg, '```txt\n' + diag + '```', { parse_mode: 'Markdown' });
+    }
+  } catch (e) {
+    log('cmd error', String(e?.message || e));
+  }
+
   // Process
   try {
     const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
     const chatId   = msg?.chat?.id;
     const textRaw  = (msg?.text ?? msg?.caption ?? '');
     const text     = (textRaw || '').trim();
-    const chatType = msg?.chat?.type;
-    const isPrivate = chatType === 'private';
+    const isPrivate= msg?.chat?.type === 'private';
     if (!chatId || isPrivate || msg?.from?.is_bot) return;
 
     const lower = (text || '').toLowerCase();
@@ -318,28 +340,21 @@ export default async function handler(req, res) {
 
     // Quick greet on mention/name + greet word (no LLM yet)
     if ((mentioned || nameCalled) && RE_GREET.test(lower)) {
-      await sendMessageInThread(msg, rnd(GREET_LINES));
-      return;
+      return void sendMessageFast(msg, rnd(GREET_LINES));
     }
 
     // LLM path ONLY when directly addressed
     if (USE_LLM_ON_MENTION && (mentioned || nameCalled || replyToBot)) {
-      // anti-flood per chat
+      // Anti-flood per chat
       const now = Date.now();
       const last = lastLLMAt.get(chatId) || 0;
-      if (now - last < LLM_COOLDOWN_MS) {
-        // Soft ignore to avoid storms
-        return;
-      }
+      if (now - last < LLM_COOLDOWN_MS) return;
       lastLLMAt.set(chatId, now);
 
-      if (!OPENAI_KEY) {
-        await sendMessageInThread(msg, "OpenAI API key is missing on the server.");
-        return;
-      }
+      if (!OPENAI_KEY) return void sendMessageFast(msg, "OpenAI API key is missing on the server.");
 
       const cleaned = stripMentionsAndName(text, BOT_USERNAME) || "Please answer briefly.";
-      await sendTypingInThread(msg).catch(()=>{});
+      sendTypingFast(msg);
 
       // Placeholder → then edit
       let mid = null;
@@ -360,7 +375,7 @@ export default async function handler(req, res) {
         finally { clearTimeout(to); }
         reply = (reply && reply.trim()) ? reply : "Got it.";
         if (mid) await editMessageInThread(msg, mid, reply);
-        else await sendMessageInThread(msg, reply);
+        else sendMessageFast(msg, reply);
       } catch (e) {
         const m = String(e?.message || e || 'unknown error');
         const friendly =
@@ -369,13 +384,13 @@ export default async function handler(req, res) {
           m.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
           `Oops: ${m}`;
         if (mid) await editMessageInThread(msg, mid, friendly);
-        else await sendMessageInThread(msg, friendly);
+        else sendMessageFast(msg, friendly);
       }
       return;
     }
 
     // Otherwise — triggers only (no LLM)
-    await processNonMention(update);
+    processNonMention(update);
   } catch (e) {
     log('process error', String(e?.message || e));
   }
