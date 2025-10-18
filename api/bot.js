@@ -9,7 +9,7 @@ const BOT_USERNAME = (process.env.BOT_USERNAME || '').toLowerCase(); // e.g. "ja
 const rnd = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const log = (...a) => { try { console.log(...a); } catch {} };
 
-// ---------- CANNED REPLIES (EN only, with multiple phrasings) ----------
+// ---------- CANNED REPLIES (EN only, multiple phrasings) ----------
 const WL_LINES = [
   "Guaranteed whitelist = **5** Woolly Eggs NFTs.",
   "Hold **5** Woolly Eggs → you’re guaranteed on the whitelist.",
@@ -55,12 +55,22 @@ const CLARIFY_LINES = [
   "Tell me what you’re looking for."
 ];
 
+// NEW: randomized Gwoolly variants (plain / egg / yarn / both)
+const GWOOLLY_LINES = [
+  "Gwoolly",
+  "Gwoolly 🥚",
+  "Gwoolly 🧶",
+  "Gwoolly 🥚🧶",
+  "Gwoolly 🧶🥚"
+];
+
 // ---------- English-only keyword triggers ----------
-const RE_WL   = /\b(whitelist|allowlist)\b/i;
-const RE_WE   = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
-const RE_SYN  = /\b(syndicate)\b/i;
-const RE_GAME = /\b(wooligotchi|wooli?gotchi|mini-?game|game|wool)\b/i;
-const RE_BYE  = /^(thanks|thank you|ok|okay|got it|all good|bye|goodbye)$/i;
+const RE_WL     = /\b(whitelist|allowlist)\b/i;
+const RE_WE     = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
+const RE_SYN    = /\b(syndicate)\b/i;
+const RE_GAME   = /\b(wooligotchi|wooli?gotchi|mini-?game|game|wool)\b/i;
+const RE_BYE    = /^(thanks|thank you|ok|okay|got it|all good|bye|goodbye)$/i;
+const RE_GWOOL  = /\b(gwoolly|gwolly|gwooly)\b/i;
 
 // ---------- Telegram helper ----------
 async function tg(method, payload) {
@@ -166,14 +176,21 @@ export default async function handler(req, res) {
   // ignore private chats entirely
   if (isPrivate) return ACK();
 
-  // short graceful close (groups only)
-  if (RE_BYE.test((text || '').toLowerCase())) {
+  const lower = (text || '').toLowerCase();
+
+  // graceful short-close (groups only)
+  if (RE_BYE.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(BYE_LINES), reply_to_message_id: msg.message_id });
     return ACK();
   }
 
+  // Gwoolly / Gwolly / Gwooly → randomized Gwoolly response (sometimes with 🥚 or 🧶)
+  if (RE_GWOOL.test(lower)) {
+    await tg('sendMessage', { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg.message_id });
+    return ACK();
+  }
+
   // Group routing:
-  const lower = (text || '').toLowerCase();
   let pass = true;
   if (isGroup) {
     const mentioned   = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
