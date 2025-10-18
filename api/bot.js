@@ -93,7 +93,6 @@ function looksLikeQuestion(txt) {
   if (!txt) return false;
   const s = txt.toLowerCase();
   if (s.includes('?')) return true;
-  // common English question words
   const Q = /\b(how|what|why|when|where|who|which|can|could|should|help|guide|idea|price|cost|how much)\b/;
   return Q.test(s);
 }
@@ -133,11 +132,17 @@ export default async function handler(req, res) {
   const text     = (msg?.text ?? msg?.caption ?? '').trim();
   const chatType = msg?.chat?.type; // private | group | supergroup | channel
   const isGroup  = chatType === 'group' || chatType === 'supergroup';
+  const isPrivate = chatType === 'private';
 
   const ACK = () => res.status(200).send('ok');
   if (!chatId) return ACK();
 
-  // short graceful close
+  // >>> NEW: ignore private chats entirely <<<
+  if (isPrivate) {
+    return ACK(); // do not respond in DMs
+  }
+
+  // short graceful close (groups only)
   if (RE_BYE.test((text || '').toLowerCase())) {
     await tg('sendMessage', { chat_id: chatId, text: rnd([
       "Anytime. Take care!",
@@ -156,7 +161,7 @@ export default async function handler(req, res) {
       (!msg?.reply_to_message?.from?.username ||
        msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME);
 
-    if (!mentioned && !replyToBot) pass = shouldReplyPassive(text); // privacy OFF case
+    if (!mentioned && !replyToBot) pass = shouldReplyPassive(text); // for Privacy OFF
   }
   if (!pass) return ACK();
 
