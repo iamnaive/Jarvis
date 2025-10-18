@@ -6,78 +6,58 @@ app.use(express.json());
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const BOT_USERNAME = process.env.BOT_USERNAME || 'Jarviseggsbot'; // Hardcode your bot username
 const VERCEL_URL = process.env.VERCEL_URL || 'https://jarvis-drab-three.vercel.app';
 
 // Store conversation contexts
 const chatContexts = new Map();
 
-// Send message via Telegram API
+// Fast Telegram API call with better error handling
 async function sendTelegramMessage(chatId, text, replyToMessageId = null) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+  
+  const payload = {
+    chat_id: chatId,
+    text: text,
+    parse_mode: 'Markdown'
+  };
+  
+  if (replyToMessageId) {
+    payload.reply_to_message_id = replyToMessageId;
+  }
+
   try {
-    const payload = {
-      chat_id: chatId,
-      text: text,
-      parse_mode: 'Markdown'
-    };
-    
-    if (replyToMessageId) {
-      payload.reply_to_message_id = replyToMessageId;
+    // Use fetch instead of axios for better performance
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      console.error('Telegram API error:', await response.text());
+      return false;
     }
 
-    const response = await axios.post(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-      payload,
-      { timeout: 5000 } // Short timeout for Telegram
-    );
-    
     console.log('✅ Message sent successfully');
-    return response.data;
+    return true;
   } catch (error) {
-    console.error('❌ Error sending message:', error.response?.data || error.message);
-    throw error;
+    console.error('❌ Failed to send message:', error.message);
+    return false;
   }
 }
 
-// Get bot info from Telegram
-async function getBotInfo() {
-  try {
-    const response = await axios.get(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getMe`,
-      { timeout: 5000 }
-    );
-    return response.data;
-  } catch (error) {
-    console.error('❌ Error getting bot info:', error.response?.data || error.message);
-    throw error;
-  }
-}
-
-// Set webhook for Telegram
-async function setWebhook() {
-  try {
-    const webhookUrl = `${VERCEL_URL}/api/bot`;
-    const response = await axios.get(
-      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${webhookUrl}&drop_pending_updates=true`,
-      { timeout: 10000 }
-    );
-    
-    console.log('✅ Webhook set successfully');
-    return response.data;
-  } catch (error) {
-    console.error('❌ Error setting webhook:', error.response?.data || error.message);
-    throw error;
-  }
-}
-
-// Quick OpenAI request with short timeout
+// Quick OpenAI request
 async function getAIResponse(messages) {
   try {
     const response = await axios.post(
       'https://api.openai.com/v1/chat/completions',
       {
-        model: 'gpt-3.5-turbo', // Faster than GPT-4
+        model: 'gpt-3.5-turbo',
         messages: messages,
-        max_tokens: 300, // Shorter responses
+        max_tokens: 300,
         temperature: 0.7
       },
       {
@@ -85,7 +65,7 @@ async function getAIResponse(messages) {
           'Authorization': `Bearer ${OPENAI_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        timeout: 8000 // Critical: must complete within 8 seconds
+        timeout: 7000 // 7 seconds max
       }
     );
 
@@ -96,7 +76,7 @@ async function getAIResponse(messages) {
   }
 }
 
-// Main webhook handler - must complete quickly!
+// Main webhook handler - optimized for Vercel
 app.post('/api/bot', async (req, res) => {
   console.log('📨 Received Telegram update');
   
@@ -125,31 +105,23 @@ async function handleMessage(msg) {
   const chatId = msg.chat.id;
   const text = msg.text || '';
   
-  console.log(`👤 Processing message from ${msg.from?.username}: ${text}`);
-
-  // Get bot username
-  let botUsername;
-  try {
-    const botInfo = await getBotInfo();
-    botUsername = botInfo.result.username;
-    console.log('🤖 Bot username:', botUsername);
-  } catch (error) {
-    console.error('❌ Error getting bot username:', error);
-    return;
-  }
+  console.log(`👤 Processing message: ${text.substring(0, 100)}`);
 
   const isGroup = ['group', 'supergroup'].includes(msg.chat.type);
   const isPrivate = msg.chat.type === 'private';
-  const isMentioned = isGroup && text.includes(`@${botUsername}`);
+  
+  // Use hardcoded bot username to avoid Telegram API calls
+  const isMentioned = isGroup && text.includes(`@${BOT_USERNAME}`);
   const isReplyToBot = msg.reply_to_message && 
                       msg.reply_to_message.from && 
-                      msg.reply_to_message.from.username === botUsername;
+                      msg.reply_to_message.from.username === BOT_USERNAME;
 
   console.log('🔍 Message analysis:', {
     isGroup,
     isPrivate,
     isMentioned,
-    isReplyToBot
+    isReplyToBot,
+    botUsername: BOT_USERNAME
   });
 
   // Respond only if:
@@ -163,7 +135,7 @@ async function handleMessage(msg) {
 
   try {
     // Clean message from mentions
-    const cleanText = text.replace(new RegExp(`@${botUsername}`, 'g'), '').trim();
+    const cleanText = text.replace(new RegExp(`@${BOT_USERNAME}`, 'g'), '').trim();
     
     if (!cleanText) {
       await sendTelegramMessage(chatId, 'Привет! Чем могу помочь?', msg.message_id);
@@ -173,8 +145,9 @@ async function handleMessage(msg) {
     console.log('🧠 Processing with OpenAI:', cleanText);
 
     // Initialize or get conversation context
-    if (!chatContexts.has(chatId)) {
-      chatContexts.set(chatId, {
+    const contextKey = `${chatId}`;
+    if (!chatContexts.has(contextKey)) {
+      chatContexts.set(contextKey, {
         messages: [
           { 
             role: 'system', 
@@ -187,7 +160,7 @@ async function handleMessage(msg) {
       });
     }
 
-    const contextData = chatContexts.get(chatId);
+    const contextData = chatContexts.get(contextKey);
     contextData.lastActivity = Date.now();
     
     const context = contextData.messages;
@@ -197,18 +170,20 @@ async function handleMessage(msg) {
 
     // Get response from OpenAI with timeout protection
     const aiResponse = await getAIResponse(context);
-    console.log('✅ OpenAI response:', aiResponse);
+    console.log('✅ OpenAI response received');
     
     // Update context with AI response
     context.push({ role: 'assistant', content: aiResponse });
     
-    // Limit context size (keep last 8 messages for speed)
-    if (context.length > 8) {
-      context.splice(1, context.length - 8);
+    // Limit context size (keep last 6 messages for speed)
+    if (context.length > 6) {
+      context.splice(1, context.length - 6);
     }
 
-    // Send response
-    await sendTelegramMessage(chatId, aiResponse, msg.message_id);
+    // Send response - don't wait for completion to avoid timeout
+    sendTelegramMessage(chatId, aiResponse, msg.message_id).catch(e => {
+      console.error('❌ Failed to send message (non-blocking):', e.message);
+    });
 
   } catch (error) {
     console.error('❌ Error in handleMessage:', error.message);
@@ -219,75 +194,64 @@ async function handleMessage(msg) {
       errorMessage = 'Слишком много запросов. Подождите немного.';
     } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
       errorMessage = 'Время ответа истекло. Попробуйте более короткий запрос.';
-    } else if (error.response?.status === 401) {
-      errorMessage = 'Ошибка аутентификации API. Проверьте ключ OpenAI.';
     }
 
-    try {
-      await sendTelegramMessage(chatId, errorMessage, msg.message_id);
-    } catch (sendError) {
-      console.error('❌ Failed to send error message:', sendError.message);
-    }
+    // Send error message without waiting
+    sendTelegramMessage(chatId, errorMessage, msg.message_id).catch(e => {
+      console.error('❌ Failed to send error message:', e.message);
+    });
   }
 }
 
 // Status endpoint
-app.get('/api/bot', async (req, res) => {
+app.get('/api/bot', (req, res) => {
+  res.json({
+    status: 'Bot is running!',
+    timestamp: new Date().toISOString(),
+    bot_username: BOT_USERNAME,
+    active_chats: chatContexts.size,
+    vercel_url: VERCEL_URL
+  });
+});
+
+// Manual webhook setup endpoint
+app.get('/api/bot/setup', async (req, res) => {
   try {
-    const botInfo = await getBotInfo();
-    const webhookInfo = await axios.get(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/getWebhookInfo`);
+    const webhookUrl = `${VERCEL_URL}/api/bot`;
+    const setupUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${webhookUrl}`;
     
     res.json({
-      status: 'Bot is running!',
-      timestamp: new Date().toISOString(),
-      bot_username: botInfo.result.username,
-      webhook_url: webhookInfo.data.result.url,
-      webhook_status: webhookInfo.data.result.pending_update_count > 0 ? 'pending' : 'ready',
-      active_chats: chatContexts.size
+      instructions: 'Open this URL in your browser to setup webhook:',
+      setup_url: setupUrl,
+      webhook_url: webhookUrl
     });
   } catch (error) {
-    res.status(500).json({ 
-      error: 'Diagnostic failed', 
-      details: error.message 
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Set webhook endpoint
-app.post('/api/bot/set-webhook', async (req, res) => {
-  try {
-    const result = await setWebhook();
-    res.json({ success: true, result });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
-
-// Initialize bot on startup
-async function initializeBot() {
-  console.log('🚀 Initializing Telegram Bot...');
+// Cleanup old contexts
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
   
-  try {
-    const botInfo = await getBotInfo();
-    console.log('✅ Bot username:', botInfo.result.username);
-    
-    await setWebhook();
-    console.log('✅ Webhook set successfully');
-  } catch (error) {
-    console.error('❌ Initialization failed:', error.message);
+  for (const [key, data] of chatContexts.entries()) {
+    if (now - data.lastActivity > 30 * 60 * 1000) { // 30 minutes
+      chatContexts.delete(key);
+      cleaned++;
+    }
   }
-}
-
-// Start initialization
-initializeBot();
+  
+  if (cleaned > 0) {
+    console.log(`🧹 Cleaned ${cleaned} old contexts`);
+  }
+}, 10 * 60 * 1000);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🤖 Bot server running on port ${PORT}`);
   console.log(`🌐 Webhook URL: ${VERCEL_URL}/api/bot`);
+  console.log(`🤖 Bot username: ${BOT_USERNAME}`);
 });
 
 module.exports = app;
