@@ -9,10 +9,25 @@ const BOT_USERNAME = (process.env.BOT_USERNAME || '').toLowerCase(); // e.g. "ja
 
 const CONTRACT_ADDR = '0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7';
 
+// ------------ utils ------------
 const rnd = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const log = (...a) => { try { console.log(...a); } catch {} };
 
-// ---------- Quick canned replies (EN only) ----------
+async function tg(method, payload) {
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(()=> '');
+      log('TG error', method, r.status, t);
+    }
+  } catch (e) { log('TG fetch error', method, String(e?.message || e)); }
+}
+
+// ------------ canned replies (EN only) ------------
 const WL_LINES = [
   `Guaranteed whitelist = 5 Woolly Eggs NFTs. Contract: ${CONTRACT_ADDR}`,
   `Hold 5 Woolly Eggs — you’re guaranteed on the whitelist. Contract: ${CONTRACT_ADDR}`,
@@ -56,7 +71,7 @@ const GREET_LINES = [
   "Hey! Jarvis here. Ask away."
 ];
 
-// ---------- English-only keyword triggers ----------
+// ------------ regex (EN only) ------------
 const RE_WL       = /\b(whitelist|allowlist)\b/i;
 const RE_WE       = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
 const RE_SYN      = /\b(syndicate)\b/i;
@@ -68,22 +83,7 @@ const RE_SNAPSHOT = /\b(snapshot)\b/i;
 const RE_JARVIS   = /\bjarvis\b/i;
 const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*evening|good\s*night|sup|what'?s\s*up)\b/i;
 
-// ---------- Telegram helper ----------
-async function tg(method, payload) {
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    if (!r.ok) {
-      const t = await r.text().catch(()=> '');
-      log('TG error', method, r.status, t);
-    }
-  } catch (e) { log('TG fetch error', method, String(e?.message || e)); }
-}
-
-// ---------- LLM ----------
+// ------------ LLM ------------
 function systemPrompt() {
   const base = process.env.SYSTEM_PROMPT || `
 You are “Jarvis”, a concise, friendly assistant and a resident of the Woolly Eggs universe (NFT collection).
@@ -108,7 +108,7 @@ async function askLLM(text, signal) {
   const r = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: { 'Authorization': `Bearer ${OPENAI_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: MODEL_ID, input: buildPrompt(text) }),
+    body: JSON.stringify({ model: MODEL_ID, input: buildPrompt(text), max_output_tokens: 220 }),
     signal
   });
   if (!r.ok) {
@@ -120,7 +120,7 @@ async function askLLM(text, signal) {
   return data.output_text ?? data.output?.[0]?.content?.[0]?.text ?? "I couldn't produce a response.";
 }
 
-// ---------- Heuristics (EN only) for passive group replies ----------
+// ------------ heuristics for passive replies ------------
 function looksLikeQuestion(txt) {
   if (!txt) return false;
   const s = txt.toLowerCase();
@@ -144,57 +144,49 @@ function shouldReplyPassive(text) {
   if (looksLikeQuestion(text)) score++;
   if (containsProjectKeywords(text)) score++;
   if (isCommandy(text)) score++;
-  return score >= 2; // require at least 2 signals
+  return score >= 2;
 }
 
-// ---------- Handler ----------
-export default async function handler(req, res) {
-  if (req.method === 'GET') return res.status(200).send('ok');
-  if (req.method !== 'POST') return res.status(200).send('ok');
-  if (!TG_TOKEN) return res.status(200).send('ok');
-
-  // raw body
-  let body = '';
-  await new Promise(resolve => { req.on('data', c => body += c); req.on('end', resolve); });
-  let update = {};
-  try { update = body ? JSON.parse(body) : {}; } catch {}
-
+// ------------ core processing ------------
+async function processUpdate(update) {
   const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
   const chatId   = msg?.chat?.id;
-  const text     = (msg?.text ?? msg?.caption ?? '').trim();
+  const textRaw  = (msg?.text ?? msg?.caption ?? '');
+  const text     = textRaw.trim();
   const chatType = msg?.chat?.type; // private | group | supergroup | channel
   const isGroup  = chatType === 'group' || chatType === 'supergroup';
-  const isPrivate = chatType === 'private';
+  const isPrivate= chatType === 'private';
 
-  const ACK = () => res.status(200).send('ok');
-  if (!chatId) return ACK();
+  if (!chatId) return;
 
   // Ignore DMs entirely
-  if (isPrivate) return ACK();
+  if (isPrivate) return;
 
-  // Short graceful close (groups only)
+  // Don't talk to bots / self
+  if (msg?.from?.is_bot) return;
+
+  // graceful close
   if (RE_BYE.test((text || '').toLowerCase())) {
     await tg('sendMessage', { chat_id: chatId, text: rnd([
       "Anytime. Take care!",
       "You're welcome. Have a good one!",
       "Glad to help. See you!"
     ]), reply_to_message_id: msg.message_id });
-    return ACK();
+    return;
   }
 
   const lower = (text || '').toLowerCase();
 
-  // ---- DIRECT MENTION / NAME-CALL: answer by meaning (LLM), no triggers required
+  // ---- DIRECT MENTION / NAME → immediate LLM (no triggers)
   const mentioned  = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
   const nameCalled = RE_JARVIS.test(lower);
   if (mentioned || nameCalled) {
-    // Greeting form when it's a hello + mention/name
+    // If it looks like a greeting, reply with greet and stop
     if (RE_GREET.test(lower)) {
       await tg('sendMessage', { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg.message_id });
-      return ACK();
+      return;
     }
 
-    // Clean the text (strip @bot and "jarvis") before sending to LLM
     const cleaned = (text || '')
       .replace(new RegExp(`@${BOT_USERNAME}`, 'ig'), '')
       .replace(/jarvis/ig, '')
@@ -202,15 +194,14 @@ export default async function handler(req, res) {
 
     if (!OPENAI_KEY) {
       await tg('sendMessage', { chat_id: chatId, text: "OpenAI API key is missing on the server." });
-      return ACK();
+      return;
     }
 
-    // typing (fire-and-forget)
     tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(()=>{});
 
     try {
       const ctrl = new AbortController();
-      const to = setTimeout(() => ctrl.abort(), 9000);
+      const to = setTimeout(() => ctrl.abort(), 7000); // shorter to avoid TG webhook timeout issues
       let reply;
       try { reply = await askLLM(cleaned || "Please greet briefly and ask how you can help.", ctrl.signal); }
       finally { clearTimeout(to); }
@@ -224,69 +215,68 @@ export default async function handler(req, res) {
         `Oops: ${m}`;
       await tg('sendMessage', { chat_id: chatId, text: friendly, reply_to_message_id: msg.message_id });
     }
-    return ACK();
+    return;
   }
 
-  // ---- MUST-REPLY (no tag) triggers:
+  // ---- MUST-REPLY (no tag) quick triggers
   if (RE_GWOOLLY.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg.message_id });
-    return ACK();
+    return;
   }
   if (RE_TWITTER.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(TWITTER_LINES), reply_to_message_id: msg.message_id });
-    return ACK();
+    return;
   }
   if (RE_SNAPSHOT.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(SNAPSHOT_LINES), reply_to_message_id: msg.message_id });
-    return ACK();
+    return;
   }
 
-  // Group routing: mention/reply or passive heuristics
+  // ---- Group passive heuristics (if no mention/reply)
   let pass = true;
   if (isGroup) {
     const replyToBot = msg?.reply_to_message?.from?.is_bot &&
       (!msg?.reply_to_message?.from?.username ||
        msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME);
     if (!replyToBot) {
-      pass = shouldReplyPassive(text); // for Privacy OFF case
+      pass = shouldReplyPassive(text);
     }
   }
-  if (!pass) return ACK();
+  if (!pass) return;
 
-  // CANNED (instant)
+  // ---- canned answers
   if (RE_WL.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(WL_LINES), reply_to_message_id: msg.message_id });
     if (RE_GAME.test(lower)) {
       await tg('sendMessage', { chat_id: chatId, text: rnd(GAME_LINES), reply_to_message_id: msg.message_id });
     }
-    return ACK();
+    return;
   }
   if (RE_WE.test(lower) || (RE_WE.test(lower) && RE_SYN.test(lower))) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(WE_ROLE_LINES), reply_to_message_id: msg.message_id });
-    return ACK();
+    return;
   }
   if (RE_GAME.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(GAME_LINES), reply_to_message_id: msg.message_id });
-    return ACK();
+    return;
   }
 
   if (!text) {
     await tg('sendMessage', { chat_id: chatId, text: "What do you need?", reply_to_message_id: msg.message_id });
-    return ACK();
+    return;
   }
 
-  // typing (fire-and-forget)
-  tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(()=>{});
-
+  // ---- LLM fallback (short timeout)
   if (!OPENAI_KEY) {
     await tg('sendMessage', { chat_id: chatId, text: "OpenAI API key is missing on the server." });
-    return ACK();
+    return;
   }
 
-  // LLM path (short timeout; serverless friendly)
+  tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(()=>{});
+
   try {
     const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 9000);
+    const to = setTimeout(() => ctrl.abort(), 7000);
     let reply;
     try { reply = await askLLM(text, ctrl.signal); }
     finally { clearTimeout(to); }
@@ -300,6 +290,27 @@ export default async function handler(req, res) {
       `Oops: ${m}`;
     await tg('sendMessage', { chat_id: chatId, text: friendly, reply_to_message_id: msg.message_id });
   }
+}
 
-  return ACK();
+// ------------ webhook handler with EARLY ACK ------------
+export default async function handler(req, res) {
+  if (req.method === 'GET') return res.status(200).send('ok');
+  if (req.method !== 'POST') return res.status(200).send('ok');
+  if (!TG_TOKEN) return res.status(200).send('ok');
+
+  // read raw body
+  let body = '';
+  await new Promise(resolve => { req.on('data', c => body += c); req.on('end', resolve); });
+  let update = {};
+  try { update = body ? JSON.parse(body) : {}; } catch {}
+
+  // 1) ACK IMMEDIATELY so Telegram won't retry/stop delivering
+  res.status(200).end('ok');
+
+  // 2) Process update "in background" (same invocation)
+  try {
+    await processUpdate(update);
+  } catch (e) {
+    log('processUpdate error', String(e?.message || e));
+  }
 }
