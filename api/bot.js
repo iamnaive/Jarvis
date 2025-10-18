@@ -13,6 +13,7 @@ const CONTRACT_ADDR = '0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7';
 const rnd = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const log = (...a) => { try { console.log(...a); } catch {} };
 
+// fire-and-forget call
 async function tg(method, payload) {
   try {
     const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
@@ -25,6 +26,23 @@ async function tg(method, payload) {
       log('TG error', method, r.status, t);
     }
   } catch (e) { log('TG fetch error', method, String(e?.message || e)); }
+}
+
+// call that RETURNS JSON (we need message_id to edit later)
+async function tgJson(method, payload) {
+  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const txt = await r.text();
+  if (!r.ok) {
+    log('TG json error', method, r.status, txt);
+    throw new Error(`TG ${method} ${r.status}`);
+  }
+  try { return JSON.parse(txt); } catch {
+    return { ok:false, raw: txt };
+  }
 }
 
 function isDirectMention(msg) {
@@ -182,14 +200,9 @@ async function processUpdate(update) {
   const isPrivate= chatType === 'private';
 
   if (!chatId) return;
+  if (isPrivate) return;          // ignore DMs
+  if (msg?.from?.is_bot) return;  // ignore bots/self
 
-  // Ignore DMs entirely
-  if (isPrivate) return;
-
-  // Don't talk to bots / self
-  if (msg?.from?.is_bot) return;
-
-  // graceful close
   if (RE_BYE.test((text || '').toLowerCase())) {
     await tg('sendMessage', { chat_id: chatId, text: rnd([
       "Anytime. Take care!",
@@ -201,7 +214,7 @@ async function processUpdate(update) {
 
   const lower = (text || '').toLowerCase();
 
-  // ---- MUST-REPLY (no tag) quick triggers
+  // MUST-REPLY triggers (no tag)
   if (RE_GWOOLLY.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg.message_id });
     return;
@@ -215,7 +228,7 @@ async function processUpdate(update) {
     return;
   }
 
-  // ---- Group passive heuristics (if no mention/reply)
+  // Passive heuristics
   let pass = true;
   if (isGroup) {
     const replyToBot = msg?.reply_to_message?.from?.is_bot &&
@@ -225,7 +238,7 @@ async function processUpdate(update) {
   }
   if (!pass) return;
 
-  // ---- canned answers
+  // CANNED answers
   if (RE_WL.test(lower)) {
     await tg('sendMessage', { chat_id: chatId, text: rnd(WL_LINES), reply_to_message_id: msg.message_id });
     if (RE_GAME.test(lower)) {
@@ -247,7 +260,7 @@ async function processUpdate(update) {
     return;
   }
 
-  // ---- LLM fallback (short timeout)
+  // LLM fallback (background)
   if (!OPENAI_KEY) {
     await tg('sendMessage', { chat_id: chatId, text: "OpenAI API key is missing on the server." });
     return;
@@ -257,7 +270,7 @@ async function processUpdate(update) {
 
   try {
     const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 7000); // <= 7s “background”
+    const to = setTimeout(() => ctrl.abort(), 9000); // 9s background
     let reply;
     try { reply = await askLLM(text, ctrl.signal, 180); }
     finally { clearTimeout(to); }
@@ -273,7 +286,7 @@ async function processUpdate(update) {
   }
 }
 
-// ------------ webhook handler: SYNC on mention, EARLY ACK otherwise ------------
+// ------------ webhook handler: ALWAYS EARLY ACK; mentions get placeholder + edit ------------
 export default async function handler(req, res) {
   if (req.method === 'GET') return res.status(200).send('ok');
   if (req.method !== 'POST') return res.status(200).send('ok');
@@ -284,62 +297,82 @@ export default async function handler(req, res) {
   let update = {};
   try { update = body ? JSON.parse(body) : {}; } catch {}
 
-  const msg    = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
-  const chatId = msg?.chat?.id;
-  const text   = (msg?.text ?? msg?.caption ?? '').trim();
-  const chatType = msg?.chat?.type;
-  const isPrivate = chatType === 'private';
+  // 1) ACK immediately
+  res.status(200).end('ok');
 
-  if (!chatId) { res.status(200).send('ok'); return; }
-  if (isPrivate) { res.status(200).send('ok'); return; } // ignore DMs
+  // 2) Process
+  try {
+    const msg    = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
+    const chatId = msg?.chat?.id;
+    const text   = (msg?.text ?? msg?.caption ?? '').trim();
+    const chatType = msg?.chat?.type;
+    const isPrivate = chatType === 'private';
+    if (!chatId || isPrivate || msg?.from?.is_bot) return;
 
-  // --- mention/name path: handle synchronously to avoid webhook retry/lag
-  const mentioned = isDirectMention(msg) || RE_JARVIS.test(text || '');
-  if (mentioned) {
-    try {
+    const mentioned = isDirectMention(msg) || RE_JARVIS.test(text || '');
+
+    if (mentioned) {
       const lower = (text || '').toLowerCase();
 
+      // Greeting path -> quick greet, done
       if (RE_GREET.test(lower)) {
         await tg('sendMessage', { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg.message_id });
-        res.status(200).send('ok');
         return;
+      }
+
+      // Placeholder → then edit to final
+      let mid = null;
+      try {
+        const ph = await tgJson('sendMessage', {
+          chat_id: chatId,
+          text: "On it…",
+          reply_to_message_id: msg.message_id
+        });
+        mid = ph?.result?.message_id || null;
+      } catch (e) {
+        // ignore; we can still send a fresh message later
       }
 
       if (!OPENAI_KEY) {
         await tg('sendMessage', { chat_id: chatId, text: "OpenAI API key is missing on the server." });
-        res.status(200).send('ok');
         return;
       }
 
       const cleaned = stripMentionsAndName(text, (process.env.BOT_USERNAME || '').toLowerCase());
       tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(()=>{});
 
-      const ctrl = new AbortController();
-      const to = setTimeout(() => ctrl.abort(), 3500); // <= 3.5s for snappy mention replies
-      let reply;
-      try { reply = await askLLM(cleaned || "Please answer briefly.", ctrl.signal, 150); }
-      finally { clearTimeout(to); }
+      try {
+        const ctrl = new AbortController();
+        const to = setTimeout(() => ctrl.abort(), 9000); // 9s in background (safe, we already ACKed)
+        let reply;
+        try { reply = await askLLM(cleaned || "Please answer briefly.", ctrl.signal, 160); }
+        finally { clearTimeout(to); }
 
-      if (!reply || !reply.trim()) reply = "Got it.";
-      await tg('sendMessage', { chat_id: chatId, text: reply, reply_to_message_id: msg.message_id });
-      res.status(200).send('ok');
-      return;
-    } catch (e) {
-      const m = String(e?.message || e || 'unknown error');
-      const friendly =
-        m.includes('429') ? 'Oops: API quota exceeded. Check Billing.' :
-        m.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-5-mini).' :
-        m.toLowerCase().includes('abort') ? 'Timed out. Please re-ask briefly.' :
-        `Oops: ${m}`;
-      await tg('sendMessage', { chat_id: chatId, text: friendly, reply_to_message_id: msg?.message_id });
-      res.status(200).send('ok');
+        if (!reply || !reply.trim()) reply = "Got it.";
+        if (mid) {
+          await tg('editMessageText', { chat_id: chatId, message_id: mid, text: reply });
+        } else {
+          await tg('sendMessage', { chat_id: chatId, text: reply, reply_to_message_id: msg.message_id });
+        }
+      } catch (e) {
+        const m = String(e?.message || e || 'unknown error');
+        const friendly =
+          m.includes('429') ? 'Oops: API quota exceeded. Check Billing.' :
+          m.includes('model_not_found') ? 'Oops: model not found. Set MODEL_ID (e.g., gpt-5-mini).' :
+          m.toLowerCase().includes('abort') ? 'Oops: model timed out. Please try again.' :
+          `Oops: ${m}`;
+        if (mid) {
+          await tg('editMessageText', { chat_id: chatId, message_id: mid, text: friendly });
+        } else {
+          await tg('sendMessage', { chat_id: chatId, text: friendly, reply_to_message_id: msg.message_id });
+        }
+      }
       return;
     }
-  }
 
-  // --- non-mention: early ACK, then process “in background”
-  res.status(200).end('ok');
-  try {
+    // Non-mention path uses background processor (triggers/heuristics/LLM)
     await processUpdate(update);
-  } catch (e) { log('processUpdate error', String(e?.message || e)); }
+  } catch (e) {
+    log('processUpdate error', String(e?.message || e));
+  }
 }
