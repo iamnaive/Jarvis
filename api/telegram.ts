@@ -1,5 +1,5 @@
 // /api/telegram.ts
-// Comments: English only. Edge webhook with DM guard + allowlists + delegation to worker.
+// Comments: English only. Edge webhook: LLM in groups only, disabled in DMs.
 
 export const config = { runtime: "edge" };
 
@@ -7,10 +7,6 @@ const TG_TOKEN  = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
 const TG_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const BOT_USERNAME = (process.env.BOT_USERNAME || "").toLowerCase().replace(/^@/, "");
 const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
-
-const DM_LLM_ENABLED = (process.env.DM_LLM_ENABLED || "false").toLowerCase() === "true";
-const ALLOW_CHAT_IDS = (process.env.ALLOW_CHAT_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
-const ALLOW_USER_IDS = (process.env.ALLOW_USER_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
 
 const CONTRACT_ADDR = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
 
@@ -33,24 +29,21 @@ const GAME_LINES = [
   "Small WOOL boost: play https://wooligotchi.vercel.app/",
   "For a little WOOL, check: https://wooligotchi.vercel.app/",
 ];
-const GWOOLLY_LINES = ["Gwoolly", "Gwoolly 🧶", "Gwoolly 🥚", "Gwoolly 🥚 🧶"];
+const GWOOLLY_LINES = ["Gwoolly", "Gwoolly", "Gwoolly"];
 const TWITTER_LINES = [
   "Official X (Twitter): https://x.com/WoollyEggs",
   "You can follow us on X here: https://x.com/WoollyEggs",
   "Our X (Twitter) page: https://x.com/WoollyEggs",
-  "X link: https://x.com/WoollyEggs",
 ];
 const SNAPSHOT_LINES = [
   "The snapshot will occur one day before the mainnet launch.",
   "Snapshot is planned for 24 hours prior to mainnet going live.",
   "Expect the snapshot a day ahead of the mainnet launch.",
-  "Snapshot happens one day before mainnet.",
 ];
 const GREET_LINES = [
   "Hey — Jarvis here. How can I help?",
   "Hi there, I’m Jarvis. What do you need?",
   "Hello! Jarvis on the line — how can I assist?",
-  "Hey! Jarvis here. Ask away.",
 ];
 
 // Regex triggers
@@ -75,6 +68,7 @@ async function tg(method: string, payload: unknown) {
   }).catch(()=>{});
 }
 
+// Light heuristics for passive replies in groups
 function looksLikeQuestion(txt?: string) {
   if (!txt) return false;
   const s = txt.toLowerCase();
@@ -114,7 +108,6 @@ export default async function handler(req: Request): Promise<Response> {
   const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
   const chatId   = msg?.chat?.id;
   const text     = (msg?.text ?? msg?.caption ?? "").trim();
-  const fromId   = msg?.from?.id ? String(msg.from.id) : "";
   const chatType = msg?.chat?.type; // private | group | supergroup | channel
   const isGroup  = chatType === "group" || chatType === "supergroup";
   const isDM     = chatType === "private";
@@ -154,15 +147,17 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("ok");
   }
 
-  // DM guard: LLM in DMs only for allowlisted users
-  const dmAllowed = DM_LLM_ENABLED && (fromId && ALLOW_USER_IDS.includes(fromId));
-  if (isDM && !dmAllowed) {
-    // no LLM calls in DMs
-    await tg("sendMessage", { chat_id: chatId, text: "DM LLM is off. Ask me in the group or contact an admin.", reply_to_message_id: msg?.message_id });
+  // DM policy: never call LLM in private chats
+  if (isDM) {
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: "DM LLM is off. Ask me in the group.",
+      reply_to_message_id: msg?.message_id
+    });
     return new Response("ok");
   }
 
-  // Group passive gate: allow only mention/reply/name or smart heuristics
+  // Group gating: mention/reply/name or heuristics
   if (isGroup) {
     let pass = false;
     if (mentioned || replyToBot || nameCalled) pass = true;
@@ -170,13 +165,9 @@ export default async function handler(req: Request): Promise<Response> {
     if (!pass) return new Response("ok");
   }
 
-  // LLM permission by chat allowlist
-  const chatAllowed = ALLOW_CHAT_IDS.includes(String(chatId));
-  const allowLLM = isDM ? dmAllowed : chatAllowed;
-
-  // Delegate to Node worker (LLM) — only if allowed
+  // Groups: allow LLM
   try {
-    if (allowLLM && INTERNAL_BEARER) {
+    if (INTERNAL_BEARER) {
       const url = new URL("/api/tg-worker", req.url);
       await fetch(url.toString(), {
         method: "POST",
@@ -189,12 +180,16 @@ export default async function handler(req: Request): Promise<Response> {
           text,
           replyTo: msg?.message_id ?? null,
           threadId: msg?.message_thread_id ?? null,
-          fromId: fromId || null,
+          // fromId not needed for this policy
         }),
       });
     } else {
-      // Lightweight echo so it's never silent, but no model usage
-      await tg("sendMessage", { chat_id: chatId, text: `Not allowed to use LLM here.`, reply_to_message_id: msg?.message_id });
+      // Safety fallback: simple echo if worker is not wired
+      await tg("sendMessage", {
+        chat_id: chatId,
+        text: `Jarvis online: "${text.slice(0,200)}"`,
+        reply_to_message_id: msg?.message_id
+      });
     }
   } catch {}
 
