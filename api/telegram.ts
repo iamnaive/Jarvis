@@ -1,5 +1,6 @@
 // /api/telegram.ts
-// Comments: English only. Edge webhook: LLM in groups only, disabled in DMs.
+// Comments: English only. Edge webhook with diagnostics: if LLM worker fails,
+// we send a short error back to the chat (only when DEBUG_LLM="true").
 
 export const config = { runtime: "edge" };
 
@@ -7,6 +8,7 @@ const TG_TOKEN  = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
 const TG_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const BOT_USERNAME = (process.env.BOT_USERNAME || "").toLowerCase().replace(/^@/, "");
 const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
+const DEBUG_LLM = (process.env.DEBUG_LLM || "true").toLowerCase() === "true";
 
 const CONTRACT_ADDR = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
 
@@ -29,21 +31,24 @@ const GAME_LINES = [
   "Small WOOL boost: play https://wooligotchi.vercel.app/",
   "For a little WOOL, check: https://wooligotchi.vercel.app/",
 ];
-const GWOOLLY_LINES = ["Gwoolly", "Gwoolly", "Gwoolly"];
+const GWOOLLY_LINES = ["Gwoolly", "Gwoolly 🧶", "Gwoolly 🥚", "Gwoolly 🥚 🧶"];
 const TWITTER_LINES = [
   "Official X (Twitter): https://x.com/WoollyEggs",
   "You can follow us on X here: https://x.com/WoollyEggs",
   "Our X (Twitter) page: https://x.com/WoollyEggs",
+  "X link: https://x.com/WoollyEggs",
 ];
 const SNAPSHOT_LINES = [
   "The snapshot will occur one day before the mainnet launch.",
   "Snapshot is planned for 24 hours prior to mainnet going live.",
   "Expect the snapshot a day ahead of the mainnet launch.",
+  "Snapshot happens one day before mainnet.",
 ];
 const GREET_LINES = [
   "Hey — Jarvis here. How can I help?",
   "Hi there, I’m Jarvis. What do you need?",
   "Hello! Jarvis on the line — how can I assist?",
+  "Hey! Jarvis here. Ask away.",
 ];
 
 // Regex triggers
@@ -59,6 +64,7 @@ const RE_JARVIS   = /\bjarvis\b/i;
 const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*evening|good\s*night|sup|what'?s\s*up)\b/i;
 
 function rnd<T>(a: T[]): T { return a[Math.floor(Math.random() * a.length)]; }
+
 async function tg(method: string, payload: unknown) {
   if (!TG_TOKEN) return;
   await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
@@ -68,7 +74,7 @@ async function tg(method: string, payload: unknown) {
   }).catch(()=>{});
 }
 
-// Light heuristics for passive replies in groups
+// Heuristics
 function looksLikeQuestion(txt?: string) {
   if (!txt) return false;
   const s = txt.toLowerCase();
@@ -115,7 +121,7 @@ export default async function handler(req: Request): Promise<Response> {
 
   const lower = (text || "").toLowerCase();
 
-  // --- MUST / canned triggers BEFORE gating
+  // --- MUST / canned BEFORE gating
   if (RE_GWOOLLY.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg?.message_id }); return new Response("ok"); }
   if (RE_TWITTER.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(TWITTER_LINES),  reply_to_message_id: msg?.message_id }); return new Response("ok"); }
   if (RE_SNAPSHOT.test(lower)){ await tg("sendMessage", { chat_id: chatId, text: rnd(SNAPSHOT_LINES),  reply_to_message_id: msg?.message_id }); return new Response("ok"); }
@@ -157,7 +163,7 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("ok");
   }
 
-  // Group gating: mention/reply/name or heuristics
+  // Group gating
   if (isGroup) {
     let pass = false;
     if (mentioned || replyToBot || nameCalled) pass = true;
@@ -165,33 +171,48 @@ export default async function handler(req: Request): Promise<Response> {
     if (!pass) return new Response("ok");
   }
 
-  // Groups: allow LLM
+  // --- Delegate to Node worker (LLM) with diagnostics
+  const url = new URL("/api/tg-worker", req.url);
   try {
-    if (INTERNAL_BEARER) {
-      const url = new URL("/api/tg-worker", req.url);
-      await fetch(url.toString(), {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "authorization": `Bearer ${INTERNAL_BEARER}`,
-        },
-        body: JSON.stringify({
-          chatId,
-          text,
-          replyTo: msg?.message_id ?? null,
-          threadId: msg?.message_thread_id ?? null,
-          // fromId not needed for this policy
-        }),
-      });
-    } else {
-      // Safety fallback: simple echo if worker is not wired
+    if (!INTERNAL_BEARER) {
+      await tg("sendMessage", { chat_id: chatId, text: "Worker secret not set (INTERNAL_BEARER).", reply_to_message_id: msg?.message_id });
+      return new Response("ok");
+    }
+    const r = await fetch(url.toString(), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "authorization": `Bearer ${INTERNAL_BEARER}`,
+      },
+      body: JSON.stringify({
+        chatId,
+        text,
+        replyTo: msg?.message_id ?? null,
+        threadId: msg?.message_thread_id ?? null,
+      }),
+    });
+
+    if (!r.ok && DEBUG_LLM) {
+      const t = await r.text().catch(()=> "");
+      const brief =
+        r.status === 403 ? "403 (forbidden) — INTERNAL_BEARER mismatch?" :
+        r.status === 500 ? "500 (server) — check OPENAI_API_KEY/MODEL_ID?" :
+        `${r.status} — ${t.slice(0,140)}`;
       await tg("sendMessage", {
         chat_id: chatId,
-        text: `Jarvis online: "${text.slice(0,200)}"`,
+        text: `LLM worker error: ${brief}`,
         reply_to_message_id: msg?.message_id
       });
     }
-  } catch {}
+  } catch (e: any) {
+    if (DEBUG_LLM) {
+      await tg("sendMessage", {
+        chat_id: chatId,
+        text: `LLM handoff failed: ${String(e?.message || e)}`,
+        reply_to_message_id: msg?.message_id
+      });
+    }
+  }
 
   return new Response("ok");
 }
