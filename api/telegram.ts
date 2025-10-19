@@ -1,5 +1,5 @@
 // /api/telegram.ts
-// Comments: English only. Vercel Edge Function.
+// Comments: English only. Edge webhook with DM guard + allowlists + delegation to worker.
 
 export const config = { runtime: "edge" };
 
@@ -7,6 +7,10 @@ const TG_TOKEN  = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
 const TG_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const BOT_USERNAME = (process.env.BOT_USERNAME || "").toLowerCase().replace(/^@/, "");
 const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
+
+const DM_LLM_ENABLED = (process.env.DM_LLM_ENABLED || "false").toLowerCase() === "true";
+const ALLOW_CHAT_IDS = (process.env.ALLOW_CHAT_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
+const ALLOW_USER_IDS = (process.env.ALLOW_USER_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
 
 const CONTRACT_ADDR = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
 
@@ -110,11 +114,13 @@ export default async function handler(req: Request): Promise<Response> {
   const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
   const chatId   = msg?.chat?.id;
   const text     = (msg?.text ?? msg?.caption ?? "").trim();
+  const fromId   = msg?.from?.id ? String(msg.from.id) : "";
   const chatType = msg?.chat?.type; // private | group | supergroup | channel
   const isGroup  = chatType === "group" || chatType === "supergroup";
+  const isDM     = chatType === "private";
   if (!chatId) return new Response("ok");
 
-  const lower = text.toLowerCase();
+  const lower = (text || "").toLowerCase();
 
   // --- MUST / canned triggers BEFORE gating
   if (RE_GWOOLLY.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg?.message_id }); return new Response("ok"); }
@@ -148,7 +154,15 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("ok");
   }
 
-  // Group passive gate
+  // DM guard: LLM in DMs only for allowlisted users
+  const dmAllowed = DM_LLM_ENABLED && (fromId && ALLOW_USER_IDS.includes(fromId));
+  if (isDM && !dmAllowed) {
+    // no LLM calls in DMs
+    await tg("sendMessage", { chat_id: chatId, text: "DM LLM is off. Ask me in the group or contact an admin.", reply_to_message_id: msg?.message_id });
+    return new Response("ok");
+  }
+
+  // Group passive gate: allow only mention/reply/name or smart heuristics
   if (isGroup) {
     let pass = false;
     if (mentioned || replyToBot || nameCalled) pass = true;
@@ -156,9 +170,13 @@ export default async function handler(req: Request): Promise<Response> {
     if (!pass) return new Response("ok");
   }
 
-  // Delegate to Node worker (LLM) — fire-and-forget style
+  // LLM permission by chat allowlist
+  const chatAllowed = ALLOW_CHAT_IDS.includes(String(chatId));
+  const allowLLM = isDM ? dmAllowed : chatAllowed;
+
+  // Delegate to Node worker (LLM) — only if allowed
   try {
-    if (INTERNAL_BEARER) {
+    if (allowLLM && INTERNAL_BEARER) {
       const url = new URL("/api/tg-worker", req.url);
       await fetch(url.toString(), {
         method: "POST",
@@ -171,11 +189,12 @@ export default async function handler(req: Request): Promise<Response> {
           text,
           replyTo: msg?.message_id ?? null,
           threadId: msg?.message_thread_id ?? null,
+          fromId: fromId || null,
         }),
       });
     } else {
-      // Fallback: simple echo so it's never silent
-      await tg("sendMessage", { chat_id: chatId, text: `Jarvis online: "${text.slice(0,200)}"`, reply_to_message_id: msg?.message_id });
+      // Lightweight echo so it's never silent, but no model usage
+      await tg("sendMessage", { chat_id: chatId, text: `Not allowed to use LLM here.`, reply_to_message_id: msg?.message_id });
     }
   } catch {}
 
