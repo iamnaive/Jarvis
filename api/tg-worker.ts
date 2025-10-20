@@ -1,5 +1,5 @@
 // /api/tg-worker.ts
-// Node worker: robust Responses API request + parsing, clearer errors.
+// Node worker: correct Responses API payload (input_text/output_text) + robust parsing.
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
@@ -34,63 +34,54 @@ Rules:
 `.trim();
 }
 
-// Build modern Responses API payload (messages-style)
+// --- Build payload for /v1/responses ---
 function buildInput(userText: string) {
   return [
     {
       role: "system",
-      content: [{ type: "text", text: systemPrompt() }],
+      content: [{ type: "input_text", text: systemPrompt() }],
     },
     {
       role: "user",
-      content: [{ type: "text", text: userText }],
+      content: [{ type: "input_text", text: userText }],
     },
   ];
 }
 
-// Robust extractor for many possible shapes of Responses API
+// --- Robust extractor for Responses API ---
 function extractText(data: any): string {
-  // 1) direct output_text (most common)
+  // 1) direct output_text
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
 
-  // 2) data.output[].content[].text
-  const fromOutput =
+  // 2) output[].content[].(type==='output_text').text
+  if (Array.isArray(data?.output)) {
+    const parts = data.output.flatMap((blk: any) =>
+      Array.isArray(blk?.content) ? blk.content : []
+    );
+    const texts = parts
+      .filter((c: any) => c?.type === "output_text" && typeof c?.text === "string")
+      .map((c: any) => c.text.trim())
+      .filter(Boolean);
+    if (texts.length) return texts.join("\n");
+  }
+
+  // 3) fallback: any content.text string fields we can find
+  const greedy =
     Array.isArray(data?.output)
       ? data.output
-          .flatMap((blk: any) =>
-            Array.isArray(blk?.content) ? blk.content : []
-          )
-          .map((c: any) => c?.text)
-          .filter((t: any) => typeof t === "string" && t.trim())
+          .flatMap((blk: any) => (Array.isArray(blk?.content) ? blk.content : []))
+          .map((c: any) => (typeof c?.text === "string" ? c.text.trim() : ""))
+          .filter(Boolean)
           .join("\n")
           .trim()
       : "";
-  if (fromOutput) return fromOutput;
+  if (greedy) return greedy;
 
-  // 3) data.message.content[].text (some server variants)
-  const fromMessage =
-    Array.isArray(data?.message?.content)
-      ? data.message.content
-          .map((c: any) => c?.text)
-          .filter((t: any) => typeof t === "string" && t.trim())
-          .join("\n")
-          .trim()
-      : "";
-  if (fromMessage) return fromMessage;
-
-  // 4) legacy-ish: choices[0].message.content (chat-completions-like)
+  // 4) legacy chat-completions-like
   const ch = data?.choices?.[0]?.message?.content;
   if (typeof ch === "string" && ch.trim()) return ch.trim();
-  if (Array.isArray(ch)) {
-    const joined = ch
-      .map((c: any) => (typeof c?.text === "string" ? c.text : ""))
-      .filter(Boolean)
-      .join("\n")
-      .trim();
-    if (joined) return joined;
-  }
 
   return "";
 }
@@ -104,8 +95,8 @@ async function askLLM(userText: string, signal?: AbortSignal) {
     },
     body: JSON.stringify({
       model: MODEL_ID,
-      input: buildInput(userText), // messages array
-      // temperature: 0.2, // optional
+      input: buildInput(userText), // uses input_text
+      // temperature: 0.2,
     }),
     signal,
   });
@@ -124,25 +115,23 @@ async function askLLM(userText: string, signal?: AbortSignal) {
 
   if (!text) {
     if (DEBUG_OPENAI) {
-      // Send short debug snippet back to the caller (trimmed)
-      const raw = JSON.stringify(data).slice(0, 800);
+      const raw = JSON.stringify(data).slice(0, 1000);
       return `Debug: empty text from model.\n(model=${MODEL_ID})\n${raw}`;
     }
-    return "I'm not sure."; // graceful fallback
+    return "I'm not sure.";
   }
   return text;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Healthcheck via GET in browser
+  // Healthcheck
   if (req.method === "GET") {
     const ready = Boolean(INTERNAL_BEARER) && Boolean(OPENAI_KEY);
     return res.status(ready ? 200 : 500).send(ready ? "ok" : "missing env");
   }
-
   if (req.method !== "POST") return res.status(200).send("ok");
 
-  // internal auth from Edge route
+  // internal auth
   const auth = req.headers.authorization || "";
   if (!INTERNAL_BEARER || auth !== `Bearer ${INTERNAL_BEARER}`) {
     return res.status(403).send("forbidden");
@@ -156,13 +145,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 30000); // give it a bit more time
+    const to = setTimeout(() => ctrl.abort(), 30000);
     let reply: string;
-    try {
-      reply = await askLLM(text, ctrl.signal);
-    } finally {
-      clearTimeout(to);
-    }
+    try { reply = await askLLM(text, ctrl.signal); } finally { clearTimeout(to); }
 
     await tg("sendMessage", {
       chat_id: chatId,
