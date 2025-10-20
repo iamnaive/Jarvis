@@ -1,6 +1,6 @@
 // /api/telegram.ts
-// Comments: English only. Edge webhook with diagnostics: if LLM worker fails,
-// we send a short error back to the chat (only when DEBUG_LLM="true").
+// Edge webhook with verbose in-chat diagnostics.
+// Turn on with DEBUG_CHAT=true (env). Keep DEBUG_CHAT=false in prod.
 
 export const config = { runtime: "edge" };
 
@@ -8,7 +8,10 @@ const TG_TOKEN  = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
 const TG_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const BOT_USERNAME = (process.env.BOT_USERNAME || "").toLowerCase().replace(/^@/, "");
 const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
-const DEBUG_LLM = (process.env.DEBUG_LLM || "true").toLowerCase() === "true";
+
+const DEBUG_CHAT = (process.env.DEBUG_CHAT || "false").toLowerCase() === "true";
+const DEBUG_LLM  = (process.env.DEBUG_LLM  || "true").toLowerCase() === "true";
+const PROBE_REPLY = (process.env.PROBE_REPLY || "false").toLowerCase() === "true";
 
 const CONTRACT_ADDR = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
 
@@ -65,7 +68,7 @@ const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*even
 
 function rnd<T>(a: T[]): T { return a[Math.floor(Math.random() * a.length)]; }
 
-async function tg(method: string, payload: unknown) {
+async function tg(method: string, payload: any) {
   if (!TG_TOKEN) return;
   await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
     method: "POST",
@@ -74,7 +77,186 @@ async function tg(method: string, payload: unknown) {
   }).catch(()=>{});
 }
 
-// Heuristics
+// safe stringify (limit size)
+function sjson(obj: any, max = 1200) {
+  const txt = JSON.stringify(obj, (k, v) => (typeof v === "string" && v.length > 120 ? v.slice(0,117)+"…" : v), 2);
+  return txt.length > max ? txt.slice(0, max - 1) + "…" : txt;
+}
+
+export default async function handler(req: Request): Promise<Response> {
+  const logs: string[] = [];
+  const say = async (chatId: number, msg: string) => {
+    if (!DEBUG_CHAT) return;
+    logs.push(msg);
+    // send once at the end (see bottom)
+  };
+
+  if (req.method === "GET") return new Response("ok");
+
+  // Secret check
+  if (TG_SECRET) {
+    const sec = req.headers.get("x-telegram-bot-api-secret-token");
+    if (sec !== TG_SECRET) {
+      // cannot send to chat (we don't know chat yet), but return 403
+      return new Response("forbidden", { status: 403 });
+    }
+  }
+
+  let update: any = {};
+  try { update = await req.json(); } catch {
+    return new Response("ok");
+  }
+
+  const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
+  const chatId   = msg?.chat?.id;
+  const text     = (msg?.text ?? msg?.caption ?? "").trim();
+  const chatType = msg?.chat?.type; // private | group | supergroup | channel
+  const isGroup  = chatType === "group" || chatType === "supergroup";
+  const isDM     = chatType === "private";
+  const threadId = msg?.message_thread_id ?? undefined;
+
+  if (!chatId) return new Response("ok");
+
+  await say(chatId, `▶ update ok | chatType=${chatType} | thread=${threadId ?? "none"}`);
+  if (DEBUG_CHAT && text) await say(chatId, `text="${text.slice(0,180)}"`);
+
+  // --- MUST / canned BEFORE gating
+  const lower = (text || "").toLowerCase();
+  const cannedHit =
+    (RE_GWOOLLY.test(lower) && "GWOOLLY") ||
+    (RE_TWITTER.test(lower) && "TWITTER") ||
+    (RE_SNAPSHOT.test(lower) && "SNAPSHOT") ||
+    (RE_WL.test(lower) && "WL") ||
+    ((RE_WE.test(lower) || (RE_WE.test(lower) && RE_SYN.test(lower))) && "WE_ROLE") ||
+    (RE_GAME.test(lower) && "GAME");
+  if (cannedHit) await say(chatId, `canned hit: ${cannedHit}`);
+
+  if (RE_GWOOLLY.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
+  if (RE_TWITTER.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(TWITTER_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
+  if (RE_SNAPSHOT.test(lower)){ await tg("sendMessage", { chat_id: chatId, text: rnd(SNAPSHOT_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
+  if (RE_WL.test(lower))      { await tg("sendMessage", { chat_id: chatId, text: rnd(WL_LINES),       reply_to_message_id: msg?.message_id, message_thread_id: threadId }); if (RE_GAME.test(lower)) await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
+  if (RE_WE.test(lower) || (RE_WE.test(lower) && RE_SYN.test(lower))) {
+    await tg("sendMessage", { chat_id: chatId, text: rnd(WE_ROLE_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
+  }
+  if (RE_GAME.test(lower))    { await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES),     reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
+
+  // Greetings
+  const mentioned  = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
+  const replyToBot = !!(msg?.reply_to_message?.from?.is_bot &&
+    (!msg?.reply_to_message?.from?.username ||
+      msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME));
+  const nameCalled = RE_JARVIS.test(lower);
+  await say(chatId, `gate: mentioned=${!!mentioned} replyToBot=${!!replyToBot} nameCalled=${!!nameCalled}`);
+
+  if ((mentioned || nameCalled) && RE_GREET.test(lower)) {
+    await tg("sendMessage", { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
+  }
+
+  // Short close
+  if (RE_BYE.test(lower)) {
+    await tg("sendMessage", { chat_id: chatId, text: rnd([
+      "Anytime. Take care!",
+      "You're welcome. Have a good one!",
+      "Glad to help. See you!",
+    ]), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
+  }
+
+  // DM policy: never call LLM in private chats
+  if (isDM) {
+    await say(chatId, `DM detected → LLM disabled by policy`);
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: "DM LLM is off. Ask me in the group.",
+      reply_to_message_id: msg?.message_id,
+      message_thread_id: threadId
+    });
+    await flushDebug(chatId, logs, threadId);
+    return new Response("ok");
+  }
+
+  // Group gating
+  let pass = false;
+  if (isGroup) {
+    pass = mentioned || replyToBot || nameCalled || shouldReplyPassive(text);
+    await say(chatId, `group gate pass=${pass} (heuristics=${shouldReplyPassive(text)})`);
+    if (!pass) { await flushDebug(chatId, logs, threadId); return new Response("ok"); }
+  }
+
+  // Delegate to Node worker (LLM) with diagnostics
+  const url = new URL("/api/tg-worker", req.url);
+
+  try {
+    if (PROBE_REPLY) {
+      await tg("sendMessage", {
+        chat_id: chatId,
+        text: "Working on it…",
+        reply_to_message_id: msg?.message_id,
+        message_thread_id: threadId
+      });
+      await say(chatId, `probe sent`);
+    }
+
+    if (!INTERNAL_BEARER) {
+      await tg("sendMessage", { chat_id: chatId, text: "Worker secret not set (INTERNAL_BEARER).", reply_to_message_id: msg?.message_id, message_thread_id: threadId });
+      await say(chatId, `handoff skipped: INTERNAL_BEARER missing`);
+      await flushDebug(chatId, logs, threadId);
+      return new Response("ok");
+    }
+
+    const r = await fetch(url.toString(), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "authorization": `Bearer ${INTERNAL_BEARER}`,
+      },
+      body: JSON.stringify({
+        chatId,
+        text,
+        replyTo: msg?.message_id ?? null,
+        threadId,
+      }),
+    });
+
+    if (!r.ok) {
+      const t = await r.text().catch(()=> "");
+      const brief =
+        r.status === 403 ? "403 (forbidden) — INTERNAL_BEARER mismatch?" :
+        r.status === 500 ? "500 (server) — check OPENAI_API_KEY/MODEL_ID?" :
+        `${r.status} — ${t.slice(0,140)}`;
+      if (DEBUG_LLM) {
+        await tg("sendMessage", {
+          chat_id: chatId,
+          text: `LLM worker error: ${brief}`,
+          reply_to_message_id: msg?.message_id,
+          message_thread_id: threadId
+        });
+      }
+      await say(chatId, `worker status=${r.status} body="${t.slice(0,120)}"`);
+    } else {
+      await say(chatId, `worker status=200 ok`);
+    }
+  } catch (e: any) {
+    const em = String(e?.message || e);
+    if (DEBUG_LLM) {
+      await tg("sendMessage", {
+        chat_id: chatId,
+        text: `LLM handoff failed: ${em}`,
+        reply_to_message_id: msg?.message_id,
+        message_thread_id: threadId
+      });
+    }
+    await say(chatId, `handoff exception: ${em}`);
+  }
+
+  await flushDebug(chatId, logs, threadId);
+  return new Response("ok");
+}
+
+// --- helpers below ---
+
 function looksLikeQuestion(txt?: string) {
   if (!txt) return false;
   const s = txt.toLowerCase();
@@ -99,120 +281,9 @@ function shouldReplyPassive(text?: string) {
   return score >= 2;
 }
 
-export default async function handler(req: Request): Promise<Response> {
-  if (req.method === "GET") return new Response("ok");
-
-  // Verify Telegram secret header
-  if (TG_SECRET) {
-    const sec = req.headers.get("x-telegram-bot-api-secret-token");
-    if (sec !== TG_SECRET) return new Response("forbidden", { status: 403 });
-  }
-
-  let update: any = {};
-  try { update = await req.json(); } catch { return new Response("ok"); }
-
-  const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
-  const chatId   = msg?.chat?.id;
-  const text     = (msg?.text ?? msg?.caption ?? "").trim();
-  const chatType = msg?.chat?.type; // private | group | supergroup | channel
-  const isGroup  = chatType === "group" || chatType === "supergroup";
-  const isDM     = chatType === "private";
-  if (!chatId) return new Response("ok");
-
-  const lower = (text || "").toLowerCase();
-
-  // --- MUST / canned BEFORE gating
-  if (RE_GWOOLLY.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg?.message_id }); return new Response("ok"); }
-  if (RE_TWITTER.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(TWITTER_LINES),  reply_to_message_id: msg?.message_id }); return new Response("ok"); }
-  if (RE_SNAPSHOT.test(lower)){ await tg("sendMessage", { chat_id: chatId, text: rnd(SNAPSHOT_LINES),  reply_to_message_id: msg?.message_id }); return new Response("ok"); }
-  if (RE_WL.test(lower))      { await tg("sendMessage", { chat_id: chatId, text: rnd(WL_LINES),       reply_to_message_id: msg?.message_id }); if (RE_GAME.test(lower)) await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES), reply_to_message_id: msg?.message_id }); return new Response("ok"); }
-  if (RE_WE.test(lower) || (RE_WE.test(lower) && RE_SYN.test(lower))) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd(WE_ROLE_LINES), reply_to_message_id: msg?.message_id });
-    return new Response("ok");
-  }
-  if (RE_GAME.test(lower))    { await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES),     reply_to_message_id: msg?.message_id }); return new Response("ok"); }
-
-  // Greetings
-  const mentioned  = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
-  const replyToBot = !!(msg?.reply_to_message?.from?.is_bot &&
-    (!msg?.reply_to_message?.from?.username ||
-      msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME));
-  const nameCalled = RE_JARVIS.test(lower);
-  if ((mentioned || nameCalled) && RE_GREET.test(lower)) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg?.message_id });
-    return new Response("ok");
-  }
-
-  // Short close
-  if (RE_BYE.test(lower)) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd([
-      "Anytime. Take care!",
-      "You're welcome. Have a good one!",
-      "Glad to help. See you!",
-    ]), reply_to_message_id: msg?.message_id });
-    return new Response("ok");
-  }
-
-  // DM policy: never call LLM in private chats
-  if (isDM) {
-    await tg("sendMessage", {
-      chat_id: chatId,
-      text: "DM LLM is off. Ask me in the group.",
-      reply_to_message_id: msg?.message_id
-    });
-    return new Response("ok");
-  }
-
-  // Group gating
-  if (isGroup) {
-    let pass = false;
-    if (mentioned || replyToBot || nameCalled) pass = true;
-    else pass = shouldReplyPassive(text);
-    if (!pass) return new Response("ok");
-  }
-
-  // --- Delegate to Node worker (LLM) with diagnostics
-  const url = new URL("/api/tg-worker", req.url);
-  try {
-    if (!INTERNAL_BEARER) {
-      await tg("sendMessage", { chat_id: chatId, text: "Worker secret not set (INTERNAL_BEARER).", reply_to_message_id: msg?.message_id });
-      return new Response("ok");
-    }
-    const r = await fetch(url.toString(), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "authorization": `Bearer ${INTERNAL_BEARER}`,
-      },
-      body: JSON.stringify({
-        chatId,
-        text,
-        replyTo: msg?.message_id ?? null,
-        threadId: msg?.message_thread_id ?? null,
-      }),
-    });
-
-    if (!r.ok && DEBUG_LLM) {
-      const t = await r.text().catch(()=> "");
-      const brief =
-        r.status === 403 ? "403 (forbidden) — INTERNAL_BEARER mismatch?" :
-        r.status === 500 ? "500 (server) — check OPENAI_API_KEY/MODEL_ID?" :
-        `${r.status} — ${t.slice(0,140)}`;
-      await tg("sendMessage", {
-        chat_id: chatId,
-        text: `LLM worker error: ${brief}`,
-        reply_to_message_id: msg?.message_id
-      });
-    }
-  } catch (e: any) {
-    if (DEBUG_LLM) {
-      await tg("sendMessage", {
-        chat_id: chatId,
-        text: `LLM handoff failed: ${String(e?.message || e)}`,
-        reply_to_message_id: msg?.message_id
-      });
-    }
-  }
-
-  return new Response("ok");
+async function flushDebug(chatId: number, logs: string[], threadId?: number) {
+  if (!DEBUG_CHAT || logs.length === 0) return;
+  // combine logs into one message to avoid spam
+  const text = `[DBG]\n` + logs.join("\n").slice(0, 3500);
+  await tg("sendMessage", { chat_id: chatId, text, message_thread_id: threadId });
 }
