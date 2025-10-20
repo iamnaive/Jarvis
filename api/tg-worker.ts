@@ -1,6 +1,6 @@
 // /api/tg-worker.ts
-// Node worker: correct Responses API payload (input_text/output_text),
-// robust parsing, small retry on 429/5xx, and clear error messages.
+// Node worker: resilient Telegram send (no throw), correct Responses API payload,
+// robust parsing, small retry on 429/5xx, clear error messages.
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
@@ -11,13 +11,21 @@ const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
 const CONTRACT_ADDR   = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
 const DEBUG_OPENAI    = (process.env.DEBUG_OPENAI || "false").toLowerCase() === "true";
 
-async function tg(method: string, payload: unknown) {
-  const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!r.ok) throw new Error(`TG ${method} ${r.status} ${await r.text()}`);
+// Never throw from tg(); just log errors.
+async function tg(method: string, payload: unknown): Promise<void> {
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      console.error(`[tg] ${method} ${r.status} ${t.slice(0,300)}`);
+    }
+  } catch (e: any) {
+    console.error(`[tg] fetch error ${method}: ${String(e?.message || e)}`);
+  }
 }
 
 function systemPrompt() {
@@ -38,47 +46,34 @@ Rules:
 // Build payload for /v1/responses (messages-style using input_text)
 function buildInput(userText: string) {
   return [
-    {
-      role: "system",
-      content: [{ type: "input_text", text: systemPrompt() }],
-    },
-    {
-      role: "user",
-      content: [{ type: "input_text", text: userText }],
-    },
+    { role: "system", content: [{ type: "input_text", text: systemPrompt() }] },
+    { role: "user",   content: [{ type: "input_text", text: userText }] },
   ];
 }
 
 // Extract text from various possible Responses API shapes
 function extractText(data: any): string {
-  // 1) output_text
-  if (typeof data?.output_text === "string" && data.output_text.trim()) {
-    return data.output_text.trim();
-  }
-  // 2) output[].content[].type === 'output_text'
+  if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
+
   if (Array.isArray(data?.output)) {
-    const parts = data.output.flatMap((blk: any) =>
-      Array.isArray(blk?.content) ? blk.content : []
-    );
+    const parts = data.output.flatMap((blk: any) => Array.isArray(blk?.content) ? blk.content : []);
     const texts = parts
       .filter((c: any) => c?.type === "output_text" && typeof c?.text === "string")
       .map((c: any) => c.text.trim())
       .filter(Boolean);
     if (texts.length) return texts.join("\n");
   }
-  // 3) greedy fallback: any .text fields under output[].content[]
-  const greedy =
-    Array.isArray(data?.output)
-      ? data.output
-          .flatMap((blk: any) => (Array.isArray(blk?.content) ? blk.content : []))
-          .map((c: any) => (typeof c?.text === "string" ? c.text.trim() : ""))
-          .filter(Boolean)
-          .join("\n")
-          .trim()
-      : "";
+
+  const greedy = Array.isArray(data?.output)
+    ? data.output
+        .flatMap((blk: any) => Array.isArray(blk?.content) ? blk.content : [])
+        .map((c: any) => (typeof c?.text === "string" ? c.text.trim() : ""))
+        .filter(Boolean)
+        .join("\n")
+        .trim()
+    : "";
   if (greedy) return greedy;
 
-  // 4) legacy chat-completions-like shape
   const ch = data?.choices?.[0]?.message?.content;
   if (typeof ch === "string" && ch.trim()) return ch.trim();
 
@@ -86,13 +81,8 @@ function extractText(data: any): string {
 }
 
 async function askLLM(userText: string, signal?: AbortSignal) {
-  const payload = {
-    model: MODEL_ID,
-    input: buildInput(userText),
-    // temperature: 0.2, // optional
-  };
+  const payload = { model: MODEL_ID, input: buildInput(userText) };
 
-  // Small retry loop on 429/5xx
   for (let attempt = 1; attempt <= 2; attempt++) {
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -105,9 +95,7 @@ async function askLLM(userText: string, signal?: AbortSignal) {
       const data = await r.json().catch(() => ({} as any));
       const text = extractText(data);
       if (text) return text;
-      return DEBUG_OPENAI
-        ? `Debug: empty text from model (model=${MODEL_ID}).`
-        : "I'm not sure.";
+      return DEBUG_OPENAI ? `Debug: empty text from model (model=${MODEL_ID}).` : "I'm not sure.";
     }
 
     let msg = `LLM error ${r.status}`;
@@ -153,24 +141,24 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let reply: string;
     try { reply = await askLLM(text, ctrl.signal); } finally { clearTimeout(to); }
 
+    // Send reply (do not throw on TG failures)
     await tg("sendMessage", {
       chat_id: chatId,
       text: reply,
       reply_to_message_id: replyTo ?? undefined,
       message_thread_id: threadId ?? undefined,
     });
+
+    return res.status(200).send("ok");
   } catch (e: any) {
     const m = String(e?.message || e || "unknown error");
-    try {
-      await tg("sendMessage", {
-        chat_id: chatId,
-        text: m.startsWith("LLM error") ? `${m} (model=${MODEL_ID})` : `Oops: ${m} (model=${MODEL_ID})`,
-        reply_to_message_id: replyTo ?? undefined,
-        message_thread_id: threadId ?? undefined,
-      });
-    } catch {}
+    // Try to notify the chat; tg() won't throw
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: m.startsWith("LLM error") ? `${m} (model=${MODEL_ID})` : `Oops: ${m} (model=${MODEL_ID})`,
+      reply_to_message_id: replyTo ?? undefined,
+      message_thread_id: threadId ?? undefined,
+    });
     return res.status(500).send(m);
   }
-
-  return res.status(200).send("ok");
 }
