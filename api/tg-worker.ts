@@ -1,5 +1,6 @@
 // /api/tg-worker.ts
-// Node worker: resilient Telegram send with smart fallbacks, correct Responses API payload,
+// Node worker: creative-by-default persona (except project triggers),
+// resilient Telegram sending with smart fallbacks, correct Responses API payload,
 // robust parsing, small retry on 429/5xx, and clear error messages.
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
@@ -8,20 +9,29 @@ const TG_TOKEN        = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "
 const OPENAI_KEY      = process.env.OPENAI_API_KEY || "";
 const MODEL_ID        = process.env.MODEL_ID || "gpt-4o-mini";
 const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
-const CONTRACT_ADDR   = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
+
+// Creative tuning
+const CREATIVE_TEMP   = Number(process.env.CREATIVE_TEMP || "0.9");
+const BASE_TEMP       = Number(process.env.BASE_TEMP || "0.2");
+
+// Optional debug
 const DEBUG_OPENAI    = (process.env.DEBUG_OPENAI || "false").toLowerCase() === "true";
 
-// Telegram send with fallback on common 400s.
+// Project constants
+const CONTRACT_ADDR   = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
+
+/* -------------------------------- Telegram send helpers -------------------------------- */
+
+// Send with fallbacks:
 // - If "message thread not found" -> retry without message_thread_id
 // - If "reply message not found"  -> retry without reply_to_message_id
 async function tgSendMessage(payload: any): Promise<void> {
   const doSend = async (p: any) => {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    return fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(p),
     });
-    return r;
   };
 
   try {
@@ -38,7 +48,7 @@ async function tgSendMessage(payload: any): Promise<void> {
       if (r2.ok) return;
       const b2 = await r2.text().catch(() => "");
       console.error(`[tg] sendMessage retry(no thread) ${r2.status} ${b2.slice(0,300)}`);
-      return; // don't throw
+      return;
     }
 
     // Retry without reply_to if reply error
@@ -48,7 +58,7 @@ async function tgSendMessage(payload: any): Promise<void> {
       if (r2.ok) return;
       const b2 = await r2.text().catch(() => "");
       console.error(`[tg] sendMessage retry(no reply) ${r2.status} ${b2.slice(0,300)}`);
-      return; // don't throw
+      return;
     }
 
     console.error(`[tg] sendMessage ${r.status} ${body.slice(0,300)}`);
@@ -57,33 +67,60 @@ async function tgSendMessage(payload: any): Promise<void> {
   }
 }
 
-function systemPrompt() {
+/* -------------------------------- Personas & prompts -------------------------------- */
+
+function isProjectTrigger(text: string): boolean {
+  const s = (text || "").toLowerCase();
+  // Mirrors telegram.ts canned triggers
+  return (
+    /\b(whitelist|allowlist)\b/.test(s) ||
+    /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/.test(s) ||
+    /\b(syndicate)\b/.test(s) ||
+    /\b(wooligotchi|wooli?gotchi|mini-?game|game|wool)\b/.test(s) ||
+    /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/.test(s) ||
+    /\b(snapshot)\b/.test(s)
+  );
+}
+
+// Creative persona (default)
+function systemPromptCreative() {
   return `
-You are “Jarvis”, a concise, friendly assistant and a resident of the Woolly Eggs universe (NFT collection).
-Always reply in ENGLISH only.
-Style: calm, neutral, laconic. No small talk unless the user clearly wants it.
-Rules:
-- Be brief: 1–3 sentences or up to 5 short bullets (<= ~90 words).
-- Do NOT proactively continue the conversation or ask follow-ups unless necessary.
-- If something about Woolly Eggs is unknown, say “I’m not sure” (do NOT invent lore).
-- If asked about whitelist: guaranteed whitelist requires 5 Woolly Eggs NFTs (contract: ${CONTRACT_ADDR}).
-- If asked about the Telegram WE role: it requires 10 Syndicate NFTs.
-- If user asks about earning a bit of WOOL, suggest the mini-game: https://wooligotchi.vercel.app/
+You are “Jarvis”, a witty, imaginative assistant from the Woolly Eggs universe.
+You may invent lore, speculate, and answer approximately without disclaimers.
+Tone: playful, concise, sometimes cinematic. Keep answers short (1–3 sentences or up to 5 bullets).
+Avoid unsafe or harmful content; if the topic is sensitive or dangerous, refuse.
 `.trim();
 }
 
-// Build payload for /v1/responses (messages-style using input_text)
-function buildInput(userText: string) {
+// Factual persona (used when project triggers are present)
+function systemPromptFactual(contractAddr: string) {
+  return `
+You are “Jarvis”, a concise, friendly assistant from the Woolly Eggs universe.
+Always reply in ENGLISH only. Be brief (1–3 sentences or up to 5 short bullets).
+Prefer clear, factual answers for project topics. Do not invent real-world facts.
+Project facts:
+- Guaranteed whitelist requires 5 Woolly Eggs NFTs (contract: ${contractAddr}).
+- WE Telegram role requires 10 Syndicate NFTs.
+- For a bit of WOOL: https://wooligotchi.vercel.app/
+`.trim();
+}
+
+// Build Responses API "messages" input with input_text
+function buildInput(userText: string, creative: boolean) {
+  const sys = creative ? systemPromptCreative() : systemPromptFactual(CONTRACT_ADDR);
   return [
-    { role: "system", content: [{ type: "input_text", text: systemPrompt() }] },
+    { role: "system", content: [{ type: "input_text", text: sys }] },
     { role: "user",   content: [{ type: "input_text", text: userText }] },
   ];
 }
 
-// Extract text from various possible Responses API shapes
+/* -------------------------------- OpenAI call & parsing -------------------------------- */
+
 function extractText(data: any): string {
+  // 1) top-level output_text
   if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
 
+  // 2) output[].content[].type === 'output_text'
   if (Array.isArray(data?.output)) {
     const parts = data.output.flatMap((blk: any) => Array.isArray(blk?.content) ? blk.content : []);
     const texts = parts
@@ -93,6 +130,7 @@ function extractText(data: any): string {
     if (texts.length) return texts.join("\n");
   }
 
+  // 3) greedy fallback
   const greedy = Array.isArray(data?.output)
     ? data.output
         .flatMap((blk: any) => Array.isArray(blk?.content) ? blk.content : [])
@@ -103,6 +141,7 @@ function extractText(data: any): string {
     : "";
   if (greedy) return greedy;
 
+  // 4) legacy chat-completions-like
   const ch = data?.choices?.[0]?.message?.content;
   if (typeof ch === "string" && ch.trim()) return ch.trim();
 
@@ -110,8 +149,17 @@ function extractText(data: any): string {
 }
 
 async function askLLM(userText: string, signal?: AbortSignal) {
-  const payload = { model: MODEL_ID, input: buildInput(userText) };
+  // Force factual on project triggers; otherwise creative by default
+  const creative = !isProjectTrigger(userText);
+  const temperature = creative ? CREATIVE_TEMP : BASE_TEMP;
 
+  const payload = {
+    model: MODEL_ID,
+    input: buildInput(userText, creative),
+    temperature,
+  };
+
+  // Small retry on 429/5xx
   for (let attempt = 1; attempt <= 2; attempt++) {
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -143,8 +191,10 @@ async function askLLM(userText: string, signal?: AbortSignal) {
   return "I'm not sure.";
 }
 
+/* -------------------------------- HTTP handler -------------------------------- */
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Healthcheck in browser
+  // Simple healthcheck
   if (req.method === "GET") {
     const ready = Boolean(INTERNAL_BEARER) && Boolean(OPENAI_KEY);
     return res.status(ready ? 200 : 500).send(ready ? "ok" : "missing env");
@@ -170,13 +220,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let reply: string;
     try { reply = await askLLM(text, ctrl.signal); } finally { clearTimeout(to); }
 
-    // Prefer replying to keep thread context; fallbacks inside tgSendMessage
-    const payload: any = {
-      chat_id: chatId,
-      text: reply,
-    };
-    if (typeof replyTo === "number") payload.reply_to_message_id = replyTo;
-    if (typeof threadId === "number") payload.message_thread_id = threadId;
+    const payload: any = { chat_id: chatId, text: reply };
+    if (typeof replyTo === "number")  payload.reply_to_message_id = replyTo;
+    if (typeof threadId === "number") payload.message_thread_id   = threadId;
 
     await tgSendMessage(payload);
     return res.status(200).send("ok");
