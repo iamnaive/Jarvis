@@ -1,14 +1,15 @@
 // /api/tg-worker.ts
-// Node worker: correct Responses API payload (input_text/output_text) + robust parsing.
+// Node worker: correct Responses API payload (input_text/output_text),
+// robust parsing, small retry on 429/5xx, and clear error messages.
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-const TG_TOKEN = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
-const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
-const MODEL_ID = process.env.MODEL_ID || "gpt-4o-mini";
+const TG_TOKEN        = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
+const OPENAI_KEY      = process.env.OPENAI_API_KEY || "";
+const MODEL_ID        = process.env.MODEL_ID || "gpt-4o-mini";
 const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
-const CONTRACT_ADDR = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
-const DEBUG_OPENAI = (process.env.DEBUG_OPENAI || "false").toLowerCase() === "true";
+const CONTRACT_ADDR   = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
+const DEBUG_OPENAI    = (process.env.DEBUG_OPENAI || "false").toLowerCase() === "true";
 
 async function tg(method: string, payload: unknown) {
   const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
@@ -34,7 +35,7 @@ Rules:
 `.trim();
 }
 
-// --- Build payload for /v1/responses ---
+// Build payload for /v1/responses (messages-style using input_text)
 function buildInput(userText: string) {
   return [
     {
@@ -48,14 +49,13 @@ function buildInput(userText: string) {
   ];
 }
 
-// --- Robust extractor for Responses API ---
+// Extract text from various possible Responses API shapes
 function extractText(data: any): string {
-  // 1) direct output_text
+  // 1) output_text
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
-
-  // 2) output[].content[].(type==='output_text').text
+  // 2) output[].content[].type === 'output_text'
   if (Array.isArray(data?.output)) {
     const parts = data.output.flatMap((blk: any) =>
       Array.isArray(blk?.content) ? blk.content : []
@@ -66,8 +66,7 @@ function extractText(data: any): string {
       .filter(Boolean);
     if (texts.length) return texts.join("\n");
   }
-
-  // 3) fallback: any content.text string fields we can find
+  // 3) greedy fallback: any .text fields under output[].content[]
   const greedy =
     Array.isArray(data?.output)
       ? data.output
@@ -79,7 +78,7 @@ function extractText(data: any): string {
       : "";
   if (greedy) return greedy;
 
-  // 4) legacy chat-completions-like
+  // 4) legacy chat-completions-like shape
   const ch = data?.choices?.[0]?.message?.content;
   if (typeof ch === "string" && ch.trim()) return ch.trim();
 
@@ -87,56 +86,61 @@ function extractText(data: any): string {
 }
 
 async function askLLM(userText: string, signal?: AbortSignal) {
-  const r = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_KEY}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: MODEL_ID,
-      input: buildInput(userText), // uses input_text
-      // temperature: 0.2,
-    }),
-    signal,
-  });
+  const payload = {
+    model: MODEL_ID,
+    input: buildInput(userText),
+    // temperature: 0.2, // optional
+  };
 
-  if (!r.ok) {
+  // Small retry loop on 429/5xx
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify(payload),
+      signal,
+    });
+
+    if (r.ok) {
+      const data = await r.json().catch(() => ({} as any));
+      const text = extractText(data);
+      if (text) return text;
+      return DEBUG_OPENAI
+        ? `Debug: empty text from model (model=${MODEL_ID}).`
+        : "I'm not sure.";
+    }
+
     let msg = `LLM error ${r.status}`;
     try {
       const j = await r.json();
       if (j?.error?.message) msg += `: ${j.error.message}`;
     } catch {}
+
+    if ((r.status === 429 || r.status >= 500) && attempt === 1) {
+      await new Promise((res) => setTimeout(res, 600));
+      continue;
+    }
     throw new Error(msg);
   }
 
-  const data = await r.json().catch(() => ({} as any));
-  const text = extractText(data);
-
-  if (!text) {
-    if (DEBUG_OPENAI) {
-      const raw = JSON.stringify(data).slice(0, 1000);
-      return `Debug: empty text from model.\n(model=${MODEL_ID})\n${raw}`;
-    }
-    return "I'm not sure.";
-  }
-  return text;
+  return "I'm not sure.";
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Healthcheck
+  // Healthcheck in browser
   if (req.method === "GET") {
     const ready = Boolean(INTERNAL_BEARER) && Boolean(OPENAI_KEY);
     return res.status(ready ? 200 : 500).send(ready ? "ok" : "missing env");
   }
+
   if (req.method !== "POST") return res.status(200).send("ok");
 
-  // internal auth
+  // Internal auth from Edge route
   const auth = req.headers.authorization || "";
   if (!INTERNAL_BEARER || auth !== `Bearer ${INTERNAL_BEARER}`) {
     return res.status(403).send("forbidden");
   }
-  if (!TG_TOKEN) return res.status(500).send("missing TELEGRAM_TOKEN");
+  if (!TG_TOKEN)   return res.status(500).send("missing TELEGRAM_TOKEN");
   if (!OPENAI_KEY) return res.status(500).send("missing OPENAI_API_KEY");
 
   const { chatId, text, replyTo, threadId } =
@@ -160,7 +164,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     try {
       await tg("sendMessage", {
         chat_id: chatId,
-        text: m.startsWith("LLM error") ? m : `Oops: ${m}`,
+        text: m.startsWith("LLM error") ? `${m} (model=${MODEL_ID})` : `Oops: ${m} (model=${MODEL_ID})`,
         reply_to_message_id: replyTo ?? undefined,
         message_thread_id: threadId ?? undefined,
       });
