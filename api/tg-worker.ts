@@ -1,6 +1,6 @@
 // /api/tg-worker.ts
-// Node worker: resilient Telegram send (no throw), correct Responses API payload,
-// robust parsing, small retry on 429/5xx, clear error messages.
+// Node worker: resilient Telegram send with smart fallbacks, correct Responses API payload,
+// robust parsing, small retry on 429/5xx, and clear error messages.
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
@@ -11,20 +11,49 @@ const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
 const CONTRACT_ADDR   = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
 const DEBUG_OPENAI    = (process.env.DEBUG_OPENAI || "false").toLowerCase() === "true";
 
-// Never throw from tg(); just log errors.
-async function tg(method: string, payload: unknown): Promise<void> {
-  try {
-    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+// Telegram send with fallback on common 400s.
+// - If "message thread not found" -> retry without message_thread_id
+// - If "reply message not found"  -> retry without reply_to_message_id
+async function tgSendMessage(payload: any): Promise<void> {
+  const doSend = async (p: any) => {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(p),
     });
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      console.error(`[tg] ${method} ${r.status} ${t.slice(0,300)}`);
+    return r;
+  };
+
+  try {
+    let r = await doSend(payload);
+    if (r.ok) return;
+
+    const body = await r.text().catch(() => "");
+    const desc = body.toLowerCase();
+
+    // Retry without thread if thread error
+    if (r.status === 400 && desc.includes("message thread not found")) {
+      const { message_thread_id, ...rest } = payload || {};
+      const r2 = await doSend(rest);
+      if (r2.ok) return;
+      const b2 = await r2.text().catch(() => "");
+      console.error(`[tg] sendMessage retry(no thread) ${r2.status} ${b2.slice(0,300)}`);
+      return; // don't throw
     }
+
+    // Retry without reply_to if reply error
+    if (r.status === 400 && (desc.includes("reply message not found") || desc.includes("replied message not found"))) {
+      const { reply_to_message_id, ...rest } = payload || {};
+      const r2 = await doSend(rest);
+      if (r2.ok) return;
+      const b2 = await r2.text().catch(() => "");
+      console.error(`[tg] sendMessage retry(no reply) ${r2.status} ${b2.slice(0,300)}`);
+      return; // don't throw
+    }
+
+    console.error(`[tg] sendMessage ${r.status} ${body.slice(0,300)}`);
   } catch (e: any) {
-    console.error(`[tg] fetch error ${method}: ${String(e?.message || e)}`);
+    console.error(`[tg] sendMessage fetch error: ${String(e?.message || e)}`);
   }
 }
 
@@ -141,23 +170,21 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let reply: string;
     try { reply = await askLLM(text, ctrl.signal); } finally { clearTimeout(to); }
 
-    // Send reply (do not throw on TG failures)
-    await tg("sendMessage", {
+    // Prefer replying to keep thread context; fallbacks inside tgSendMessage
+    const payload: any = {
       chat_id: chatId,
       text: reply,
-      reply_to_message_id: replyTo ?? undefined,
-      message_thread_id: threadId ?? undefined,
-    });
+    };
+    if (typeof replyTo === "number") payload.reply_to_message_id = replyTo;
+    if (typeof threadId === "number") payload.message_thread_id = threadId;
 
+    await tgSendMessage(payload);
     return res.status(200).send("ok");
   } catch (e: any) {
     const m = String(e?.message || e || "unknown error");
-    // Try to notify the chat; tg() won't throw
-    await tg("sendMessage", {
+    await tgSendMessage({
       chat_id: chatId,
       text: m.startsWith("LLM error") ? `${m} (model=${MODEL_ID})` : `Oops: ${m} (model=${MODEL_ID})`,
-      reply_to_message_id: replyTo ?? undefined,
-      message_thread_id: threadId ?? undefined,
     });
     return res.status(500).send(m);
   }
