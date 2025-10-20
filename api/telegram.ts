@@ -1,18 +1,20 @@
 // /api/telegram.ts
-// Edge webhook with verbose in-chat diagnostics.
-// Turn on with DEBUG_CHAT=true (env). Keep DEBUG_CHAT=false in prod.
+// Edge webhook: LLM in groups only (DM disabled), robust mention detection,
+// in-chat diagnostics (toggle via env), and safe handoff to /api/tg-worker.
 
 export const config = { runtime: "edge" };
 
-const TG_TOKEN  = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
-const TG_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || "";
-const BOT_USERNAME = (process.env.BOT_USERNAME || "").toLowerCase().replace(/^@/, "");
-const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
+// --- ENV ---
+const TG_TOKEN       = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
+const TG_SECRET      = process.env.TELEGRAM_WEBHOOK_SECRET || "";
+const BOT_USERNAME   = (process.env.BOT_USERNAME || "").toLowerCase().replace(/^@/, "");
+const INTERNAL_BEARER= process.env.INTERNAL_BEARER || "";
 
-const DEBUG_CHAT = (process.env.DEBUG_CHAT || "false").toLowerCase() === "true";
-const DEBUG_LLM  = (process.env.DEBUG_LLM  || "true").toLowerCase() === "true";
-const PROBE_REPLY = (process.env.PROBE_REPLY || "false").toLowerCase() === "true";
+const DEBUG_CHAT  = (process.env.DEBUG_CHAT  || "false").toLowerCase() === "true";  // verbose [DBG] messages in chat
+const DEBUG_LLM   = (process.env.DEBUG_LLM   || "true").toLowerCase() === "true";   // show worker errors to chat
+const PROBE_REPLY = (process.env.PROBE_REPLY || "false").toLowerCase() === "true";  // send "Working on it…" before LLM handoff
 
+// --- Project constants ---
 const CONTRACT_ADDR = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
 
 // Quick canned replies
@@ -66,9 +68,9 @@ const RE_SNAPSHOT = /\b(snapshot)\b/i;
 const RE_JARVIS   = /\bjarvis\b/i;
 const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*evening|good\s*night|sup|what'?s\s*up)\b/i;
 
+// --- Utils ---
 function rnd<T>(a: T[]): T { return a[Math.floor(Math.random() * a.length)]; }
-
-async function tg(method: string, payload: any) {
+async function tg(method: string, payload: unknown) {
   if (!TG_TOKEN) return;
   await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
     method: "POST",
@@ -77,35 +79,58 @@ async function tg(method: string, payload: any) {
   }).catch(()=>{});
 }
 
-// safe stringify (limit size)
-function sjson(obj: any, max = 1200) {
+function looksLikeQuestion(txt?: string) {
+  if (!txt) return false;
+  const s = txt.toLowerCase();
+  if (s.includes("?")) return true;
+  return /\b(how|what|why|when|where|who|which|can|could|should|help|guide|idea|price|cost|how much)\b/.test(s);
+}
+function containsProjectKeywords(txt?: string) {
+  if (!txt) return false;
+  const s = txt.toLowerCase();
+  return /\b(woolly\s*eggs|woolly|eggs|syndicate|wooligotchi|whitelist|allowlist|we\s*role|we-?role|mini-?game|wool|snapshot)\b/.test(s);
+}
+function isCommandy(txt?: string) {
+  if (!txt) return false;
+  const s = txt.trim().toLowerCase();
+  return /\b(tell|show|give|make|start|run|explain|calculate|calc|share|provide|list)\b/.test(s);
+}
+function shouldReplyPassive(text?: string) {
+  let score = 0;
+  if (looksLikeQuestion(text)) score++;
+  if (containsProjectKeywords(text)) score++;
+  if (isCommandy(text)) score++;
+  return score >= 2;
+}
+
+// safe stringify for debug
+function compact(obj: any, max = 1200) {
   const txt = JSON.stringify(obj, (k, v) => (typeof v === "string" && v.length > 120 ? v.slice(0,117)+"…" : v), 2);
   return txt.length > max ? txt.slice(0, max - 1) + "…" : txt;
 }
 
+async function flushDebug(chatId: number, logs: string[], threadId?: number) {
+  if (!DEBUG_CHAT || logs.length === 0) return;
+  const text = `[DBG]\n` + logs.join("\n").slice(0, 3500);
+  await tg("sendMessage", { chat_id: chatId, text, message_thread_id: threadId });
+}
+
+// --- Handler ---
 export default async function handler(req: Request): Promise<Response> {
   const logs: string[] = [];
-  const say = async (chatId: number, msg: string) => {
-    if (!DEBUG_CHAT) return;
-    logs.push(msg);
-    // send once at the end (see bottom)
-  };
+  const log = async (chatId: number, s: string) => { if (DEBUG_CHAT) logs.push(s); };
 
   if (req.method === "GET") return new Response("ok");
 
-  // Secret check
+  // Secret header check (from Telegram setWebhook)
   if (TG_SECRET) {
     const sec = req.headers.get("x-telegram-bot-api-secret-token");
-    if (sec !== TG_SECRET) {
-      // cannot send to chat (we don't know chat yet), but return 403
-      return new Response("forbidden", { status: 403 });
-    }
+    if (sec !== TG_SECRET) return new Response("forbidden", { status: 403 });
   }
 
+  // Parse update
   let update: any = {};
-  try { update = await req.json(); } catch {
-    return new Response("ok");
-  }
+  try { update = await req.json(); } catch { return new Response("ok"); }
 
   const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
   const chatId   = msg?.chat?.id;
@@ -114,14 +139,45 @@ export default async function handler(req: Request): Promise<Response> {
   const isGroup  = chatType === "group" || chatType === "supergroup";
   const isDM     = chatType === "private";
   const threadId = msg?.message_thread_id ?? undefined;
+  const entities = (msg?.entities || msg?.caption_entities || []) as Array<any>;
 
   if (!chatId) return new Response("ok");
+  await log(chatId, `▶ update ok | chatType=${chatType} | thread=${threadId ?? "none"}`);
+  if (DEBUG_CHAT && text) await log(chatId, `text="${text.slice(0,180)}"`);
 
-  await say(chatId, `▶ update ok | chatType=${chatType} | thread=${threadId ?? "none"}`);
-  if (DEBUG_CHAT && text) await say(chatId, `text="${text.slice(0,180)}"`);
+  // --- Robust mention / reply / name-called detection
+  const lower = (text || "").toLowerCase();
+
+  const mentionedByText =
+    BOT_USERNAME ? lower.includes(`@${BOT_USERNAME}`) : false;
+
+  const mentionedByEntity = (() => {
+    if (!BOT_USERNAME || !text) return false;
+    return entities.some((e) => {
+      if (e?.type !== "mention") return false;
+      const slice = text.slice(e.offset, e.offset + e.length).toLowerCase();
+      return slice === `@${BOT_USERNAME}`;
+    });
+  })();
+
+  const mentionedUserEntity = (() => {
+    if (!BOT_USERNAME) return false;
+    return entities.some((e) => {
+      if (e?.type !== "text_mention") return false;
+      const u = e.user;
+      return !!(u?.is_bot && u?.username && u.username.toLowerCase() === BOT_USERNAME);
+    });
+  })();
+
+  const mentioned  = mentionedByText || mentionedByEntity || mentionedUserEntity;
+  const replyToBot = !!(msg?.reply_to_message?.from?.is_bot &&
+    (!msg?.reply_to_message?.from?.username ||
+      msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME));
+  const nameCalled = RE_JARVIS.test(text || "");
+
+  await log(chatId, `gate: mentioned=${mentioned} (text=${mentionedByText} ent=${mentionedByEntity} userEnt=${mentionedUserEntity}) replyToBot=${!!replyToBot} nameCalled=${!!nameCalled}`);
 
   // --- MUST / canned BEFORE gating
-  const lower = (text || "").toLowerCase();
   const cannedHit =
     (RE_GWOOLLY.test(lower) && "GWOOLLY") ||
     (RE_TWITTER.test(lower) && "TWITTER") ||
@@ -129,7 +185,7 @@ export default async function handler(req: Request): Promise<Response> {
     (RE_WL.test(lower) && "WL") ||
     ((RE_WE.test(lower) || (RE_WE.test(lower) && RE_SYN.test(lower))) && "WE_ROLE") ||
     (RE_GAME.test(lower) && "GAME");
-  if (cannedHit) await say(chatId, `canned hit: ${cannedHit}`);
+  if (cannedHit) await log(chatId, `canned hit: ${cannedHit}`);
 
   if (RE_GWOOLLY.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
   if (RE_TWITTER.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(TWITTER_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
@@ -142,13 +198,6 @@ export default async function handler(req: Request): Promise<Response> {
   if (RE_GAME.test(lower))    { await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES),     reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
 
   // Greetings
-  const mentioned  = BOT_USERNAME && lower.includes(`@${BOT_USERNAME}`);
-  const replyToBot = !!(msg?.reply_to_message?.from?.is_bot &&
-    (!msg?.reply_to_message?.from?.username ||
-      msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME));
-  const nameCalled = RE_JARVIS.test(lower);
-  await say(chatId, `gate: mentioned=${!!mentioned} replyToBot=${!!replyToBot} nameCalled=${!!nameCalled}`);
-
   if ((mentioned || nameCalled) && RE_GREET.test(lower)) {
     await tg("sendMessage", { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
     await flushDebug(chatId, logs, threadId); return new Response("ok");
@@ -164,9 +213,9 @@ export default async function handler(req: Request): Promise<Response> {
     await flushDebug(chatId, logs, threadId); return new Response("ok");
   }
 
-  // DM policy: never call LLM in private chats
+  // --- Policy: DMs never call LLM
   if (isDM) {
-    await say(chatId, `DM detected → LLM disabled by policy`);
+    await log(chatId, `DM detected → LLM disabled by policy`);
     await tg("sendMessage", {
       chat_id: chatId,
       text: "DM LLM is off. Ask me in the group.",
@@ -177,17 +226,16 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("ok");
   }
 
-  // Group gating
-  let pass = false;
+  // --- Group gate: mention/reply/name OR heuristics
   if (isGroup) {
-    pass = mentioned || replyToBot || nameCalled || shouldReplyPassive(text);
-    await say(chatId, `group gate pass=${pass} (heuristics=${shouldReplyPassive(text)})`);
+    const heur = shouldReplyPassive(text);
+    const pass = mentioned || replyToBot || nameCalled || heur;
+    await log(chatId, `group gate pass=${pass} (heuristics=${heur})`);
     if (!pass) { await flushDebug(chatId, logs, threadId); return new Response("ok"); }
   }
 
-  // Delegate to Node worker (LLM) with diagnostics
+  // --- Delegate to Node worker (/api/tg-worker)
   const url = new URL("/api/tg-worker", req.url);
-
   try {
     if (PROBE_REPLY) {
       await tg("sendMessage", {
@@ -196,12 +244,12 @@ export default async function handler(req: Request): Promise<Response> {
         reply_to_message_id: msg?.message_id,
         message_thread_id: threadId
       });
-      await say(chatId, `probe sent`);
+      await log(chatId, `probe sent`);
     }
 
     if (!INTERNAL_BEARER) {
       await tg("sendMessage", { chat_id: chatId, text: "Worker secret not set (INTERNAL_BEARER).", reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-      await say(chatId, `handoff skipped: INTERNAL_BEARER missing`);
+      await log(chatId, `handoff skipped: INTERNAL_BEARER missing`);
       await flushDebug(chatId, logs, threadId);
       return new Response("ok");
     }
@@ -234,9 +282,9 @@ export default async function handler(req: Request): Promise<Response> {
           message_thread_id: threadId
         });
       }
-      await say(chatId, `worker status=${r.status} body="${t.slice(0,120)}"`);
+      await log(chatId, `worker status=${r.status} body="${t.slice(0,200)}"`);
     } else {
-      await say(chatId, `worker status=200 ok`);
+      await log(chatId, `worker status=200 ok`);
     }
   } catch (e: any) {
     const em = String(e?.message || e);
@@ -248,42 +296,9 @@ export default async function handler(req: Request): Promise<Response> {
         message_thread_id: threadId
       });
     }
-    await say(chatId, `handoff exception: ${em}`);
+    await log(chatId, `handoff exception: ${em}`);
   }
 
   await flushDebug(chatId, logs, threadId);
   return new Response("ok");
-}
-
-// --- helpers below ---
-
-function looksLikeQuestion(txt?: string) {
-  if (!txt) return false;
-  const s = txt.toLowerCase();
-  if (s.includes("?")) return true;
-  return /\b(how|what|why|when|where|who|which|can|could|should|help|guide|idea|price|cost|how much)\b/.test(s);
-}
-function containsProjectKeywords(txt?: string) {
-  if (!txt) return false;
-  const s = txt.toLowerCase();
-  return /\b(woolly\s*eggs|woolly|eggs|syndicate|wooligotchi|whitelist|allowlist|we\s*role|we-?role|mini-?game|wool|snapshot)\b/.test(s);
-}
-function isCommandy(txt?: string) {
-  if (!txt) return false;
-  const s = txt.trim().toLowerCase();
-  return /\b(tell|show|give|make|start|run|explain|calculate|calc|share|provide|list)\b/.test(s);
-}
-function shouldReplyPassive(text?: string) {
-  let score = 0;
-  if (looksLikeQuestion(text)) score++;
-  if (containsProjectKeywords(text)) score++;
-  if (isCommandy(text)) score++;
-  return score >= 2;
-}
-
-async function flushDebug(chatId: number, logs: string[], threadId?: number) {
-  if (!DEBUG_CHAT || logs.length === 0) return;
-  // combine logs into one message to avoid spam
-  const text = `[DBG]\n` + logs.join("\n").slice(0, 3500);
-  await tg("sendMessage", { chat_id: chatId, text, message_thread_id: threadId });
 }
