@@ -1,23 +1,23 @@
 // /api/telegram.ts
-// Edge webhook: LLM in groups only (DM disabled), robust mention detection,
-// in-chat diagnostics (toggle via env), and safe handoff to /api/tg-worker.
+// Edge webhook: LLM in groups only (DMs disabled), robust mention detection,
+// optional in-chat diagnostics, and safe handoff to /api/tg-worker.
 
 export const config = { runtime: "edge" };
 
 // --- ENV ---
-const TG_TOKEN       = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
-const TG_SECRET      = process.env.TELEGRAM_WEBHOOK_SECRET || "";
-const BOT_USERNAME   = (process.env.BOT_USERNAME || "").toLowerCase().replace(/^@/, "");
-const INTERNAL_BEARER= process.env.INTERNAL_BEARER || "";
+const TG_TOKEN        = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
+const TG_SECRET       = process.env.TELEGRAM_WEBHOOK_SECRET || "";
+const BOT_USERNAME    = (process.env.BOT_USERNAME || "").toLowerCase().replace(/^@/, "");
+const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
 
 const DEBUG_CHAT  = (process.env.DEBUG_CHAT  || "false").toLowerCase() === "true";  // verbose [DBG] messages in chat
-const DEBUG_LLM   = (process.env.DEBUG_LLM   || "true").toLowerCase() === "true";   // show worker errors to chat
+const DEBUG_LLM   = (process.env.DEBUG_LLM   || "false").toLowerCase() === "true";  // send worker errors to chat
 const PROBE_REPLY = (process.env.PROBE_REPLY || "false").toLowerCase() === "true";  // send "Working on it…" before LLM handoff
 
 // --- Project constants ---
 const CONTRACT_ADDR = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
 
-// Quick canned replies
+// Quick canned replies (English only)
 const WL_LINES = [
   `Guaranteed whitelist = 5 Woolly Eggs NFTs. Contract: ${CONTRACT_ADDR}`,
   `Hold 5 Woolly Eggs — you’re guaranteed on the whitelist. Contract: ${CONTRACT_ADDR}`,
@@ -70,13 +70,14 @@ const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*even
 
 // --- Utils ---
 function rnd<T>(a: T[]): T { return a[Math.floor(Math.random() * a.length)]; }
+
 async function tg(method: string, payload: unknown) {
   if (!TG_TOKEN) return;
   await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
-  }).catch(()=>{});
+  }).catch(() => {});
 }
 
 function looksLikeQuestion(txt?: string) {
@@ -103,16 +104,11 @@ function shouldReplyPassive(text?: string) {
   return score >= 2;
 }
 
-// safe stringify for debug
-function compact(obj: any, max = 1200) {
-  const txt = JSON.stringify(obj, (k, v) => (typeof v === "string" && v.length > 120 ? v.slice(0,117)+"…" : v), 2);
-  return txt.length > max ? txt.slice(0, max - 1) + "…" : txt;
-}
-
+// Send a single compact debug message (if DEBUG_CHAT=true)
 async function flushDebug(chatId: number, logs: string[], threadId?: number) {
   if (!DEBUG_CHAT || logs.length === 0) return;
-  const text = `[DBG]\n` + logs.join("\n").slice(0, 3500);
-  await tg("sendMessage", { chat_id: chatId, text, message_thread_id: threadId });
+  const txt = `[DBG]\n` + logs.join("\n").slice(0, 3500);
+  await tg("sendMessage", { chat_id: chatId, text: txt, message_thread_id: threadId });
 }
 
 // --- Handler ---
@@ -122,13 +118,13 @@ export default async function handler(req: Request): Promise<Response> {
 
   if (req.method === "GET") return new Response("ok");
 
-  // Secret header check (from Telegram setWebhook)
+  // Verify Telegram secret header (matches setWebhook secret_token)
   if (TG_SECRET) {
     const sec = req.headers.get("x-telegram-bot-api-secret-token");
     if (sec !== TG_SECRET) return new Response("forbidden", { status: 403 });
   }
 
-  // Parse update
+  // Parse Telegram update
   let update: any = {};
   try { update = await req.json(); } catch { return new Response("ok"); }
 
@@ -140,17 +136,15 @@ export default async function handler(req: Request): Promise<Response> {
   const isDM     = chatType === "private";
   const threadId = msg?.message_thread_id ?? undefined;
   const entities = (msg?.entities || msg?.caption_entities || []) as Array<any>;
-
   if (!chatId) return new Response("ok");
+
   await log(chatId, `▶ update ok | chatType=${chatType} | thread=${threadId ?? "none"}`);
   if (DEBUG_CHAT && text) await log(chatId, `text="${text.slice(0,180)}"`);
 
-  // --- Robust mention / reply / name-called detection
+  // Robust mention / reply / name-called / greeting detection
   const lower = (text || "").toLowerCase();
 
-  const mentionedByText =
-    BOT_USERNAME ? lower.includes(`@${BOT_USERNAME}`) : false;
-
+  const mentionedByText = BOT_USERNAME ? lower.includes(`@${BOT_USERNAME}`) : false;
   const mentionedByEntity = (() => {
     if (!BOT_USERNAME || !text) return false;
     return entities.some((e) => {
@@ -159,7 +153,6 @@ export default async function handler(req: Request): Promise<Response> {
       return slice === `@${BOT_USERNAME}`;
     });
   })();
-
   const mentionedUserEntity = (() => {
     if (!BOT_USERNAME) return false;
     return entities.some((e) => {
@@ -168,25 +161,18 @@ export default async function handler(req: Request): Promise<Response> {
       return !!(u?.is_bot && u?.username && u.username.toLowerCase() === BOT_USERNAME);
     });
   })();
-
   const mentioned  = mentionedByText || mentionedByEntity || mentionedUserEntity;
+
   const replyToBot = !!(msg?.reply_to_message?.from?.is_bot &&
     (!msg?.reply_to_message?.from?.username ||
       msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME));
-  const nameCalled = RE_JARVIS.test(text || "");
+
+  const nameCalled = RE_JARVIS.test(lower);
+  const greeted    = RE_GREET.test(lower);
 
   await log(chatId, `gate: mentioned=${mentioned} (text=${mentionedByText} ent=${mentionedByEntity} userEnt=${mentionedUserEntity}) replyToBot=${!!replyToBot} nameCalled=${!!nameCalled}`);
 
-  // --- MUST / canned BEFORE gating
-  const cannedHit =
-    (RE_GWOOLLY.test(lower) && "GWOOLLY") ||
-    (RE_TWITTER.test(lower) && "TWITTER") ||
-    (RE_SNAPSHOT.test(lower) && "SNAPSHOT") ||
-    (RE_WL.test(lower) && "WL") ||
-    ((RE_WE.test(lower) || (RE_WE.test(lower) && RE_SYN.test(lower))) && "WE_ROLE") ||
-    (RE_GAME.test(lower) && "GAME");
-  if (cannedHit) await log(chatId, `canned hit: ${cannedHit}`);
-
+  // Canned triggers (instant replies; do NOT go to LLM)
   if (RE_GWOOLLY.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
   if (RE_TWITTER.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(TWITTER_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
   if (RE_SNAPSHOT.test(lower)){ await tg("sendMessage", { chat_id: chatId, text: rnd(SNAPSHOT_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
@@ -197,13 +183,16 @@ export default async function handler(req: Request): Promise<Response> {
   }
   if (RE_GAME.test(lower))    { await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES),     reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
 
-  // Greetings
-  if ((mentioned || nameCalled) && RE_GREET.test(lower)) {
+  // Greetings policy:
+  // - DMs: send canned greeting (LLM is off in DMs) and exit.
+  // - Groups: DO NOT send canned greeting; allow it to fall through to LLM.
+  if (isDM && (mentioned || nameCalled) && greeted) {
     await tg("sendMessage", { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
+    await flushDebug(chatId, logs, threadId);
+    return new Response("ok");
   }
 
-  // Short close
+  // Short close (canned)
   if (RE_BYE.test(lower)) {
     await tg("sendMessage", { chat_id: chatId, text: rnd([
       "Anytime. Take care!",
@@ -213,9 +202,8 @@ export default async function handler(req: Request): Promise<Response> {
     await flushDebug(chatId, logs, threadId); return new Response("ok");
   }
 
-  // --- Policy: DMs never call LLM
+  // DMs policy: never call LLM
   if (isDM) {
-    await log(chatId, `DM detected → LLM disabled by policy`);
     await tg("sendMessage", {
       chat_id: chatId,
       text: "DM LLM is off. Ask me in the group.",
@@ -226,15 +214,15 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("ok");
   }
 
-  // --- Group gate: mention/reply/name OR heuristics
+  // Group gate: allow LLM on mention/reply/name OR greeting OR heuristics
   if (isGroup) {
     const heur = shouldReplyPassive(text);
-    const pass = mentioned || replyToBot || nameCalled || heur;
-    await log(chatId, `group gate pass=${pass} (heuristics=${heur})`);
+    const pass = mentioned || replyToBot || nameCalled || greeted || heur;
+    await log(chatId, `group gate pass=${pass} (heuristics=${heur} greeted=${greeted})`);
     if (!pass) { await flushDebug(chatId, logs, threadId); return new Response("ok"); }
   }
 
-  // --- Delegate to Node worker (/api/tg-worker)
+  // Delegate to Node worker (/api/tg-worker)
   const url = new URL("/api/tg-worker", req.url);
   try {
     if (PROBE_REPLY) {
@@ -269,7 +257,7 @@ export default async function handler(req: Request): Promise<Response> {
     });
 
     if (!r.ok) {
-      const t = await r.text().catch(()=> "");
+      const t = await r.text().catch(() => "");
       const brief =
         r.status === 403 ? "403 (forbidden) — INTERNAL_BEARER mismatch?" :
         r.status === 500 ? "500 (server) — check OPENAI_API_KEY/MODEL_ID?" :
