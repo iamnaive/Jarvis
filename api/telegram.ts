@@ -1,6 +1,6 @@
 // /api/telegram.ts
 // Edge webhook: LLM in groups only (DMs disabled), robust mention detection,
-// optional in-chat diagnostics, and safe handoff to /api/tg-worker.
+// optional in-chat diagnostics, safe handoff to /api/tg-worker, and smart thanks-only handling.
 
 export const config = { runtime: "edge" };
 
@@ -61,14 +61,13 @@ const RE_WL       = /\b(whitelist|allowlist)\b/i;
 const RE_WE       = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
 const RE_SYN      = /\b(syndicate)\b/i;
 const RE_GAME     = /\b(wooligotchi|wooli?gotchi|mini-?game|game|wool)\b/i;
-const RE_BYE      = /\b(thanks|thank you|ok|okay|got it|all good|bye|goodbye)\b/i;
 const RE_GWOOLLY  = /\bgwoolly\b/i;
 const RE_TWITTER  = /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/i;
 const RE_SNAPSHOT = /\b(snapshot)\b/i;
 const RE_JARVIS   = /\bjarvis\b/i;
 const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*evening|good\s*night|sup|what'?s\s*up)\b/i;
 
-// --- Utils ---
+// Utils
 function rnd<T>(a: T[]): T { return a[Math.floor(Math.random() * a.length)]; }
 
 async function tg(method: string, payload: unknown) {
@@ -102,6 +101,15 @@ function shouldReplyPassive(text?: string) {
   if (containsProjectKeywords(text)) score++;
   if (isCommandy(text)) score++;
   return score >= 2;
+}
+
+// Thanks/ack detection: true if message is a plain thanks/ack without a question
+function isThanksOnly(txt?: string): boolean {
+  if (!txt) return false;
+  const s = txt.toLowerCase().trim();
+  const hasThanks = /\b(thanks|thank you|ty|ok|okay|got it|all good|appreciated|cheers)\b/i.test(s);
+  const hasQuestion = s.includes("?") || /\b(how|what|why|when|where|who|which|can|could|should|help|price|cost|how much)\b/i.test(s);
+  return hasThanks && !hasQuestion;
 }
 
 // Send a single compact debug message (if DEBUG_CHAT=true)
@@ -192,14 +200,16 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("ok");
   }
 
-  // Short close (canned)
-  if (RE_BYE.test(lower)) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd([
-      "Anytime. Take care!",
-      "You're welcome. Have a good one!",
-      "Glad to help. See you!",
-    ]), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
+  // Short close: pure thanks/ack (no question) → reply once and stop
+  if (isThanksOnly(text)) {
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: rnd(["Anytime. Take care.", "You're welcome.", "Glad to help."]),
+      reply_to_message_id: msg?.message_id,
+      message_thread_id: threadId
+    });
+    await flushDebug(chatId, logs, threadId);
+    return new Response("ok");
   }
 
   // DMs policy: never call LLM
