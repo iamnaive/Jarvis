@@ -60,7 +60,6 @@ const GREET_LINES = [
 const RE_WL       = /\b(whitelist|allowlist)\b/i;
 const RE_WE       = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
 const RE_SYN      = /\b(syndicate)\b/i;
-const RE_GAME     = /\b(wooligotchi|wooli?gotchi|mini-?game|game|wool)\b/i;
 const RE_GWOOLLY  = /\bgwoolly\b/i;
 const RE_TWITTER  = /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/i;
 const RE_SNAPSHOT = /\b(snapshot)\b/i;
