@@ -1,7 +1,8 @@
 // /api/tg-worker.ts
 // Node worker: creative-by-default persona (except project triggers),
 // resilient Telegram sending with smart fallbacks, correct Responses API payload,
-// robust parsing, small retry on 429/5xx, temperature auto-fallback, and emoji stripping.
+// robust parsing, small retry on 429/5xx, temperature auto-fallback,
+// emoji stripping, and soft trimming of the "Woolly Eggs universe" stamp.
 
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
@@ -83,6 +84,22 @@ function stripEmojis(s: string): string {
     .trim();
 }
 
+/* -------------------------------- Brand soft trimming -------------------------------- */
+
+// Softly remove the "Woolly Eggs universe" stamp when the user didn't bring up the project.
+function softBrandTrim(userText: string, out: string): string {
+  if (!out) return out;
+  const u = (userText || "").toLowerCase();
+  const userMentionsProject =
+    /\bwoolly\s*eggs\b/i.test(u) || /\bsyndicate\b/i.test(u) || /\bwool\b/i.test(u);
+
+  if (userMentionsProject) return out; // keep if the topic is clearly project-related
+
+  let s = out.replace(/\b(?:in|from|within)\s+the\s+Woolly\s*Eggs\s+universe\b/gi, "");
+  s = s.replace(/\s{2,}/g, " ").replace(/^[,;:\-\s]+/, "").replace(/\s+([,;:.!?])/g, "$1").trim();
+  return s;
+}
+
 /* -------------------------------- Personas & prompts -------------------------------- */
 
 function isProjectTrigger(text: string): boolean {
@@ -102,7 +119,8 @@ function isProjectTrigger(text: string): boolean {
 function systemPromptCreative() {
   return `
 You are “Jarvis”, a witty, imaginative assistant from the Woolly Eggs universe.
-You may invent lore, speculate, and answer approximately without disclaimers.
+Do not mention “Woolly Eggs universe” unless the user explicitly mentions Woolly Eggs or the topic requires it.
+Do not ask follow-up questions unless the user asks for more.
 Tone: playful, concise, sometimes cinematic. Keep answers short (1–3 sentences or up to 5 bullets).
 Do not use emojis, kaomoji, emoji-like unicode, or decorative symbols.
 Avoid unsafe or harmful content; if the topic is sensitive or dangerous, refuse.
@@ -113,11 +131,12 @@ Avoid unsafe or harmful content; if the topic is sensitive or dangerous, refuse.
 function systemPromptFactual(contractAddr: string) {
   return `
 You are “Jarvis”, a concise, friendly assistant from the Woolly Eggs universe.
-Always reply in ENGLISH only. Be brief (1–3 sentences or up to 5 short bullets).
-Prefer clear, factual answers for project topics. Do not invent real-world facts.
-Do not use emojis, kaomoji, emoji-like unicode, or decorative symbols.
+Do not mention “Woolly Eggs universe” unless the user explicitly mentions Woolly Eggs or the topic requires it.
+Do not ask follow-up questions unless the user asks for more.
+Always reply in ENGLISH only. Be brief (1–3 sentences or up to 5 short bullets). Prefer clear, factual answers for project topics.
+Do not invent real-world facts. Do not use emojis, kaomoji, emoji-like unicode, or decorative symbols.
 Project facts:
-- Guaranteed whitelist requires 5 Woolly Eggs NFTs (contract: ${contractAddr}).
+- Guaranteed whitelist requires 5 Woolly Eggs NFTs (contract: ${CONTRACT_ADDR}).
 - WE Telegram role requires 10 Syndicate NFTs.
 - For a bit of WOOL: https://wooligotchi.vercel.app/
 `.trim();
@@ -177,12 +196,12 @@ function buildPayload(model: string, input: any, temperature?: number) {
 
 async function askLLM(userText: string, signal?: AbortSignal) {
   // Creative by default; factual if project triggers detected.
-  const creative    = !isProjectTrigger(userText);
+  let creative    = !isProjectTrigger(userText);
   const temperature = creative ? CREATIVE_TEMP : BASE_TEMP;
 
   const messages = buildInput(userText, creative);
 
-  // First try with temperature (works for e.g. gpt-4o-mini). Some models don't support it.
+  // First try with temperature (some models may not support it).
   let payload: any = buildPayload(MODEL_ID, messages, temperature);
 
   // Retry loop: handles 429/5xx; also handles 400 "Unsupported parameter: 'temperature'"
@@ -213,7 +232,6 @@ async function askLLM(userText: string, signal?: AbortSignal) {
       errBody.error.message.toLowerCase().includes("unsupported parameter: 'temperature'");
 
     if (unsupportedTemp) {
-      // Drop temperature and retry immediately
       payload = buildPayload(MODEL_ID, messages); // no temperature field
       const r2 = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
@@ -274,8 +292,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let reply: string;
     try { reply = await askLLM(text, ctrl.signal); } finally { clearTimeout(to); }
 
-    // Optional post-processing to strip emojis from the final text
-    const out = NO_EMOJI ? stripEmojis(reply) : reply;
+    // 1) optional emoji stripping
+    const out0 = NO_EMOJI ? stripEmojis(reply) : reply;
+    // 2) soft brand trimming if user didn't mention the project
+    const out  = softBrandTrim(text, out0);
 
     const payload: any = { chat_id: chatId, text: out };
     if (typeof replyTo === "number")  payload.reply_to_message_id = replyTo;
