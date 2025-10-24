@@ -1,4 +1,4 @@
-// /api/telegram.js
+// /api/telegram.ts
 // Edge webhook: LLM in groups only (DMs disabled), robust mention detection,
 // optional in-chat diagnostics, safe handoff to /api/tg-worker, and smart thanks-only handling.
 
@@ -29,6 +29,12 @@ const WE_ROLE_LINES = [
   "To get the WE role in Telegram, hold 10 Syndicate NFTs.",
   "WE role → hold 10 Syndicate NFTs (Telegram).",
   "You’ll receive the WE Telegram role once you hold 10 Syndicate NFTs.",
+];
+const ONE_SYN_LINES = [
+  "Holding **1 Syndicate NFT** grants you a **FCFS slot on mainnet**.",
+  "With **one Syndicate NFT**, you get a **first-come, first-served slot** when mainnet goes live.",
+  "**1 Syndicate** is enough to secure a **FCFS mainnet slot**.",
+  "Own **1 Syndicate NFT** → you have a **FCFS spot on mainnet**."
 ];
 const GAME_LINES = [
   "Want to earn some WOOL? Try the mini-game: https://wooligotchi.vercel.app/",
@@ -67,37 +73,74 @@ const RE_TWITTER  = /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twi
 const RE_SNAPSHOT = /\b(snapshot)\b/i;
 const RE_JARVIS   = /\bjarvis\b/i;
 const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*evening|good\s*night|sup|what'?s\s*up)\b/i;
+// NEW: “1 syndicate” variations
+const RE_ONE_SYN  = /\b(1\s*syndicate|one\s+syndicate|1\s*syn)\b/i;
 
 // Utils
-function rnd(a) { return a[Math.floor(Math.random() * a.length)]; }
+function rnd(a: string[]) { return a[Math.floor(Math.random() * a.length)]; }
 
-async function tg(method, payload) {
+// robust Telegram call: reply_parameters + fallbacks for reply/thread errors
+async function tg(method: string, payload: any) {
   if (!TG_TOKEN) return;
-  await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(payload),
-  }).catch(() => {});
+
+  // prefer reply_parameters (устойчивее) + поддержка тредов
+  if (payload?.reply_to_message_id) {
+    payload.reply_parameters = { message_id: payload.reply_to_message_id, allow_sending_without_reply: true };
+    delete payload.reply_to_message_id;
+  }
+
+  const doCall = async (p: any) =>
+    fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(p),
+    });
+
+  try {
+    let r = await doCall(payload);
+    if (r.ok) return;
+
+    const txt = await r.text().catch(() => "");
+    const low = txt.toLowerCase();
+
+    // fallback #1: reply not found → без реплая
+    if (method === "sendMessage" && /repl(?:y|ied)\s+message\s+not\s+found/.test(low)) {
+      const { reply_parameters, ...rest } = payload || {};
+      await doCall(rest);
+      return;
+    }
+
+    // fallback #2: thread not found → убираем message_thread_id
+    if (method === "sendMessage" && /message\s+thread\s+not\s+found/.test(low)) {
+      const { message_thread_id, ...rest } = payload || {};
+      await doCall(rest);
+      return;
+    }
+
+    console.log("TG error", method, r.status, txt.slice(0, 300));
+  } catch (e: any) {
+    console.log("TG fetch error", method, String(e?.message || e));
+  }
 }
 
-function looksLikeQuestion(txt) {
+function looksLikeQuestion(txt?: string) {
   if (!txt) return false;
   const s = txt.toLowerCase();
   if (s.includes("?")) return true;
   return /\b(how|what|why|when|where|who|which|can|could|should|help|guide|idea|price|cost|how much)\b/.test(s);
 }
-function containsProjectKeywords(txt) {
+function containsProjectKeywords(txt?: string) {
   if (!txt) return false;
   const s = txt.toLowerCase();
   // NOTE: removed "wool" here
   return /\b(woolly\s*eggs|woolly|eggs|syndicate|wooligotchi|whitelist|allowlist|we\s*role|we-?role|mini-?game|snapshot)\b/.test(s);
 }
-function isCommandy(txt) {
+function isCommandy(txt?: string) {
   if (!txt) return false;
   const s = txt.trim().toLowerCase();
   return /\b(tell|show|give|make|start|run|explain|calculate|calc|share|provide|list)\b/.test(s);
 }
-function shouldReplyPassive(text) {
+function shouldReplyPassive(text?: string) {
   let score = 0;
   if (looksLikeQuestion(text)) score++;
   if (containsProjectKeywords(text)) score++;
@@ -106,7 +149,7 @@ function shouldReplyPassive(text) {
 }
 
 // Thanks/ack detection: true if message is a plain thanks/ack without a question
-function isThanksOnly(txt) {
+function isThanksOnly(txt?: string) {
   if (!txt) return false;
   const s = txt.toLowerCase().trim();
   const hasThanks = /\b(thanks|thank you|ty|ok|okay|got it|all good|appreciated|cheers)\b/i.test(s);
@@ -115,16 +158,16 @@ function isThanksOnly(txt) {
 }
 
 // Send a single compact debug message (if DEBUG_CHAT=true)
-async function flushDebug(chatId, logs, threadId) {
+async function flushDebug(chatId: number, logs: string[], threadId?: number) {
   if (!DEBUG_CHAT || logs.length === 0) return;
   const txt = `[DBG]\n` + logs.join("\n").slice(0, 3500);
   await tg("sendMessage", { chat_id: chatId, text: txt, message_thread_id: threadId });
 }
 
 // --- Handler ---
-export default async function handler(req) {
-  const logs = [];
-  const log = async (chatId, s) => { if (DEBUG_CHAT) logs.push(s); };
+export default async function handler(req: Request) {
+  const logs: string[] = [];
+  const log = async (_chatId: number, s: string) => { if (DEBUG_CHAT) logs.push(s); };
 
   if (req.method === "GET") return new Response("ok");
 
@@ -135,17 +178,17 @@ export default async function handler(req) {
   }
 
   // Parse Telegram update
-  let update = {};
+  let update: any = {};
   try { update = await req.json(); } catch { return new Response("ok"); }
 
   const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
-  const chatId   = msg?.chat?.id;
-  const text     = (msg?.text ?? msg?.caption ?? "").trim();
-  const chatType = msg?.chat?.type; // private | group | supergroup | channel
+  const chatId   = msg?.chat?.id as number | undefined;
+  const text     = (msg?.text ?? msg?.caption ?? "").trim() as string;
+  const chatType = msg?.chat?.type as string; // private | group | supergroup | channel
   const isGroup  = chatType === "group" || chatType === "supergroup";
   const isDM     = chatType === "private";
-  const threadId = msg?.message_thread_id ?? undefined;
-  const entities = (msg?.entities || msg?.caption_entities || []);
+  const threadId = (msg?.message_thread_id ?? undefined) as number | undefined;
+  const entities = (msg?.entities || msg?.caption_entities || []) as any[];
   if (!chatId) return new Response("ok");
 
   await log(chatId, `▶ update ok | chatType=${chatType} | thread=${threadId ?? "none"}`);
@@ -154,7 +197,7 @@ export default async function handler(req) {
   // Robust mention / reply / name-called / greeting detection
   const lower = (text || "").toLowerCase();
 
-  const mentionedByText = BOT_USERNAME ? lower.includes(`@${BOT_USERNAME}`) : false;
+  const mentionedByText   = BOT_USERNAME ? lower.includes(`@${BOT_USERNAME}`) : false;
   const mentionedByEntity = (() => {
     if (!BOT_USERNAME || !text) return false;
     return entities.some((e) => {
@@ -183,31 +226,45 @@ export default async function handler(req) {
   await log(chatId, `gate: mentioned=${mentioned} (text=${mentionedByText} ent=${mentionedByEntity} userEnt=${mentionedUserEntity}) replyToBot=${!!replyToBot} nameCalled=${!!nameCalled}`);
 
   // Canned triggers (instant replies; do NOT go to LLM)
-  if (RE_GWOOLLY.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
-  if (RE_TWITTER.test(lower)) { await tg("sendMessage", { chat_id: chatId, text: rnd(TWITTER_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
-  if (RE_SNAPSHOT.test(lower)){ await tg("sendMessage", { chat_id: chatId, text: rnd(SNAPSHOT_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
-  if (RE_WL.test(lower))      { 
-    await tg("sendMessage", { chat_id: chatId, text: rnd(WL_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId }); 
-    // optional second message if the same text also mentions game
+  if (RE_GWOOLLY.test(lower)) {
+    await tg("sendMessage", { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
+  }
+  if (RE_TWITTER.test(lower)) {
+    await tg("sendMessage", { chat_id: chatId, text: rnd(TWITTER_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId });
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
+  }
+  if (RE_SNAPSHOT.test(lower)) {
+    await tg("sendMessage", { chat_id: chatId, text: rnd(SNAPSHOT_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId });
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
+  }
+  // NEW: “1 syndicate” → FCFS slot
+  if (RE_ONE_SYN.test(lower)) {
+    await tg("sendMessage", { chat_id: chatId, text: rnd(ONE_SYN_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
+  }
+  if (RE_WL.test(lower)) {
+    await tg("sendMessage", { chat_id: chatId, text: rnd(WL_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
     if (RE_GAME.test(lower)) {
       await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
     }
-    await flushDebug(chatId, logs, threadId); 
-    return new Response("ok"); 
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
   }
   if (RE_WE.test(lower) || (RE_WE.test(lower) && RE_SYN.test(lower))) {
     await tg("sendMessage", { chat_id: chatId, text: rnd(WE_ROLE_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
     await flushDebug(chatId, logs, threadId); return new Response("ok");
   }
-  if (RE_GAME.test(lower))    { await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES),     reply_to_message_id: msg?.message_id, message_thread_id: threadId }); await flushDebug(chatId, logs, threadId); return new Response("ok"); }
+  if (RE_GAME.test(lower)) {
+    await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
+  }
 
   // Greetings policy:
   // - DMs: send canned greeting (LLM is off in DMs) and exit.
   // - Groups: DO NOT send canned greeting; allow it to fall through to LLM.
   if (isDM && (mentioned || nameCalled) && greeted) {
     await tg("sendMessage", { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    await flushDebug(chatId, logs, threadId);
-    return new Response("ok");
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
   }
 
   // Short close: pure thanks/ack (no question) → reply once and stop
@@ -218,8 +275,7 @@ export default async function handler(req) {
       reply_to_message_id: msg?.message_id,
       message_thread_id: threadId
     });
-    await flushDebug(chatId, logs, threadId);
-    return new Response("ok");
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
   }
 
   // DMs policy: never call LLM
@@ -230,8 +286,7 @@ export default async function handler(req) {
       reply_to_message_id: msg?.message_id,
       message_thread_id: threadId
     });
-    await flushDebug(chatId, logs, threadId);
-    return new Response("ok");
+    await flushDebug(chatId, logs, threadId); return new Response("ok");
   }
 
   // Group gate: allow LLM on mention/reply/name OR greeting OR heuristics
@@ -294,7 +349,7 @@ export default async function handler(req) {
     } else {
       await log(chatId, `worker status=200 ok`);
     }
-  } catch (e) {
+  } catch (e: any) {
     const em = String(e?.message || e);
     if (DEBUG_LLM) {
       await tg("sendMessage", {
