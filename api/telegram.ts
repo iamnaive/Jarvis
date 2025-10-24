@@ -60,6 +60,8 @@ const GREET_LINES = [
 const RE_WL       = /\b(whitelist|allowlist)\b/i;
 const RE_WE       = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
 const RE_SYN      = /\b(syndicate)\b/i;
+// NOTE: removed standalone "wool" from this regex
+const RE_GAME     = /\b(wooligotchi|wooli?gotchi|mini-?game|game)\b/i;
 const RE_GWOOLLY  = /\bgwoolly\b/i;
 const RE_TWITTER  = /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/i;
 const RE_SNAPSHOT = /\b(snapshot)\b/i;
@@ -87,7 +89,8 @@ function looksLikeQuestion(txt?: string) {
 function containsProjectKeywords(txt?: string) {
   if (!txt) return false;
   const s = txt.toLowerCase();
-  return /\b(woolly\s*eggs|woolly|eggs|syndicate|wooligotchi|whitelist|allowlist|we\s*role|we-?role|mini-?game|wool|snapshot)\b/.test(s);
+  // NOTE: removed "wool" here
+  return /\b(woolly\s*eggs|woolly|eggs|syndicate|wooligotchi|whitelist|allowlist|we\s*role|we-?role|mini-?game|snapshot)\b/.test(s);
 }
 function isCommandy(txt?: string) {
   if (!txt) return false;
