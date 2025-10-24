@@ -1,5 +1,6 @@
 // api/telegram.js
-// Edge webhook for Telegram bot: groups-only LLM, mention-gated, thanks-only handling.
+// Edge webhook for Telegram bot: groups-only, mention-gated,
+// canned (regex) responses for project FAQs, and LLM fallback.
 // Comments: English only.
 
 export const config = { runtime: "edge" };
@@ -14,6 +15,17 @@ const DEBUG_CHAT  = (process.env.DEBUG_CHAT  || "false").toLowerCase() === "true
 const DEBUG_LLM   = (process.env.DEBUG_LLM   || "false").toLowerCase() === "true";
 const PROBE_REPLY = (process.env.PROBE_REPLY || "false").toLowerCase() === "true";
 const NO_EMOJI    = (process.env.NO_EMOJI    || "true").toLowerCase() === "true";
+
+/** Project links & facts via ENV (safe defaults are empty strings) */
+const LINK_SITE       = process.env.LINK_SITE       || "";
+const LINK_TWITTER    = process.env.LINK_TWITTER    || "";
+const LINK_DISCORD    = process.env.LINK_DISCORD    || "";
+const LINK_WECUTROOM  = process.env.LINK_WECUTROOM  || "";  // e.g. Notion/Mirror/Docs
+const LINK_GAMES      = process.env.LINK_GAMES      || "";  // hub/landing for games
+const NFT_CONTRACT    = process.env.NFT_CONTRACT    || "0x88c78d5852f45935324c6d100052958f694e8446";
+
+const SNAPSHOT_DATE   = (process.env.SNAPSHOT_DATE || "").trim(); // e.g. "2025-10-24 13:00 UTC"
+const SNAPSHOT_NOTE   = (process.env.SNAPSHOT_NOTE || "").trim(); // free-form, optional
 
 /** ===== Telegram helpers ===== */
 
@@ -66,20 +78,126 @@ function isStart(text) {
   return /^\/start\b/.test(text || "");
 }
 
-// Minimal safe greeting lines (no questions to avoid follow-up invites).
+// Minimal safe greeting lines (no questions).
 const GREET_LINES = [
   "Hey — Jarvis here.",
   "Hi there, I’m Jarvis.",
   "Hello! Jarvis here."
 ];
 
-// Thanks-only detector: no question marks, mostly gratitude.
+// Thanks-only detector: acknowledge without starting a new thread.
 function isThanksOnly(text) {
   if (!text) return false;
-  if (/[?!]/.test(text) && !/!$/.test(text)) return false; // treat '?' as not thanks-only
+  if (/[?]/.test(text)) return false; // has a question mark -> not thanks-only
   const t = text.toLowerCase();
   return /\b(thanks|thank you|спасибо|thx|ty|appreciate it|благодарю)\b/.test(t)
     && !/\b(why|how|when|where|what|когда|как|почему|зачем)\b/.test(t);
+}
+
+/** ===== Canned responses (project FAQ) =====
+ * Order matters: first match wins. Keep answers short, no emojis, no questions.
+ * Add/modify patterns and texts as needed.
+ */
+const CANNED = [
+  {
+    // Syndicate NFTs: role and FCFS info
+    id: "syndicate_role_fcfs",
+    re: /\b(syndicate|синдикат)\b/i,
+    text: () => [
+      "Syndicate NFTs:",
+      "• WE Telegram role requires 10 Syndicate NFTs.",
+      "• 1 Syndicate NFT grants an FCFS slot on mainnet.",
+      LINK_TWITTER ? `More: ${LINK_TWITTER}` : ""
+    ].filter(Boolean).join("\n")
+  },
+  {
+    // Whitelist requirement: 5 WE NFTs
+    id: "whitelist_requirement",
+    re: /\b(whitelist|allowlist|вайтлист|аллоулист|wl)\b/i,
+    text: () => [
+      "Guaranteed whitelist requires 5 Woolly Eggs NFTs.",
+      `Contract: ${NFT_CONTRACT}`,
+      LINK_SITE ? `Site: ${LINK_SITE}` : ""
+    ].filter(Boolean).join("\n")
+  },
+  {
+    // Snapshot
+    id: "snapshot",
+    re: /\b(snapshot|снэпшот|снапшот)\b/i,
+    text: () => {
+      const lines = ["Snapshot:"];
+      if (SNAPSHOT_DATE) lines.push(`• Date: ${SNAPSHOT_DATE}`);
+      if (SNAPSHOT_NOTE) lines.push(`• Note: ${SNAPSHOT_NOTE}`);
+      if (!SNAPSHOT_DATE && !SNAPSHOT_NOTE) lines.push("• Details: TBA");
+      if (LINK_TWITTER) lines.push(`Updates: ${LINK_TWITTER}`);
+      return lines.join("\n");
+    }
+  },
+  {
+    // Games info
+    id: "games",
+    re: /\b(game|игра|игры|mini-?game|minigame)\b/i,
+    text: () => [
+      "We are shipping playable mini-games already.",
+      LINK_GAMES ? `Hub: ${LINK_GAMES}` : (LINK_SITE ? `More: ${LINK_SITE}` : "")
+    ].filter(Boolean).join("\n")
+  },
+  {
+    // WE Cut Room / content room
+    id: "wecutroom",
+    re: /\b(wecutroom|cut\s*room|векатрум|катрум)\b/i,
+    text: () => [
+      "WECutRoom: curated clips and content for the community.",
+      LINK_WECUTROOM ? `Link: ${LINK_WECUTROOM}` : ""
+    ].filter(Boolean).join("\n")
+  },
+  {
+    // TG agent / bot mention
+    id: "tg_agent",
+    re: /\b(agent|jarvis|бот|bot|assistant)\b/i,
+    text: () => [
+      "Telegram agent is live in groups with mention-gated replies.",
+      "Creative mode by default, specific project triggers are deterministic."
+    ].join("\n")
+  },
+  {
+    // Wallet gate / vault
+    id: "wallet_gate",
+    re: /\b(wallet|vault|кошел[её]к|gate|gated)\b/i,
+    text: () => [
+      "Access is wallet-gated by NFTs.",
+      `Accepted: ERC-721 from ${NFT_CONTRACT}`,
+      LINK_SITE ? `More: ${LINK_SITE}` : ""
+    ].filter(Boolean).join("\n")
+  },
+  {
+    // WE lore mention without prompting LLM to go cinematic
+    id: "we_is_not_just_nft",
+    re: /\b(we\s*is\s*not\s*just\s*nft|we\s*это\s*не\s*просто\s*nft|not\s+just\s+nft)\b/i,
+    text: () => [
+      "WE is not just an NFT — we already ship products:",
+      LINK_WECUTROOM ? `• WECutRoom: ${LINK_WECUTROOM}` : "• WECutRoom",
+      LINK_GAMES ? `• Games: ${LINK_GAMES}` : "• Games",
+      "• Telegram agent for the community.",
+      LINK_TWITTER ? `Follow: ${LINK_TWITTER}` : ""
+    ].filter(Boolean).join("\n")
+  }
+];
+
+/** Try canned first; return string or empty string if no match. */
+function cannedReply(text) {
+  if (!text) return "";
+  for (const item of CANNED) {
+    if (item.re.test(text)) {
+      try {
+        const out = typeof item.text === "function" ? item.text() : String(item.text || "");
+        return (out || "").trim();
+      } catch {
+        // ignore and continue
+      }
+    }
+  }
+  return "";
 }
 
 /** ===== LLM bridge ===== */
@@ -119,6 +237,7 @@ export default async function handler(req) {
     if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
     if (!TG_TOKEN) return new Response("Bot token missing", { status: 500 });
 
+    // Optional Telegram secret
     if (TG_SECRET) {
       const secret = req.headers.get("x-telegram-bot-api-secret-token") || "";
       if (secret !== TG_SECRET) return new Response("Forbidden", { status: 403 });
@@ -136,10 +255,10 @@ export default async function handler(req) {
     const dm = isPrivateChat(msg);
     const hasMention = addressedToBot(text, entities);
 
-    // DMs are disabled (LLM only in groups).
+    // DMs: disabled (LLM only in groups)
     if (dm) return new Response("OK", { status: 200 });
 
-    // In groups: respond only if @mentioned.
+    // Groups: respond only when @mentioned
     if (isGroup && !hasMention) return new Response("OK", { status: 200 });
 
     // /start greeting (groups only, on mention)
@@ -149,33 +268,36 @@ export default async function handler(req) {
       return new Response("OK", { status: 200 });
     }
 
-    // Thanks-only: acknowledge once, do not start a new thread of questions.
+    // Thanks-only short ack
     if (isThanksOnly(text)) {
-      // Short non-inviting ack; no questions.
       await tgSend(chatId, "You’re welcome.");
       return new Response("OK", { status: 200 });
     }
 
-    // Optional probe so users see instant feedback.
+    // Canned reply (deterministic, no LLM)
+    const canned = cannedReply(text);
+    if (canned) {
+      await tgSend(chatId, canned);
+      if (DEBUG_CHAT) await tgSend(chatId, `[DBG] canned=true`);
+      return new Response("OK", { status: 200 });
+    }
+
+    // Optional probe so users see instant feedback
     if (PROBE_REPLY) {
       await tgSend(chatId, "Working on it…");
     }
 
-    // Simple routing: "factual" when technical keywords are present.
+    // Simple routing for LLM fallback
     const factual = /\b(contract|address|allowlist|whitelist|abi|rpc|tx|gas|wallet|mint|supply|redis|postgres|leaderboard)\b/i.test(
       text
     );
     const mode = factual ? "factual" : "creative";
 
-    const CONTRACT = process.env.NFT_CONTRACT || "0x88c78d5852f45935324c6d100052958f694e8446";
-
     const reply = await (async () => {
       try {
-        return await callWorker(text, mode, { contractAddr: CONTRACT });
+        return await callWorker(text, mode, { contractAddr: NFT_CONTRACT });
       } catch (err) {
-        if (DEBUG_LLM) {
-          return `[LLM] ${err?.message || "error"}`;
-        }
+        if (DEBUG_LLM) return `[LLM] ${err?.message || "error"}`;
         return "Something went wrong. Try again later.";
       }
     })();
@@ -183,12 +305,12 @@ export default async function handler(req) {
     await tgSend(chatId, reply);
 
     if (DEBUG_CHAT) {
-      await tgSend(chatId, `[DBG] mode=${mode} mention=${hasMention} dm=${dm}`);
+      await tgSend(chatId, `[DBG] mode=${mode} canned=false mention=${hasMention} dm=${dm}`);
     }
 
     return new Response("OK", { status: 200 });
   } catch (err) {
-    // Best-effort soft error
+    // Soft error
     try {
       const body = await req.text();
       console.error("TG handler error:", err, " body:", body);
