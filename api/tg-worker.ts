@@ -10,7 +10,7 @@ import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const TG_TOKEN        = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
 const OPENAI_KEY      = process.env.OPENAI_API_KEY || "";
-const MODEL_ID        = process.env.MODEL_ID || "gpt-4o-mini";
+const MODEL_ID        = process.env.MODEL_ID || "gpt-5-mini";
 const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
 
 const CREATIVE_TEMP   = Number(process.env.CREATIVE_TEMP || "0.9"); // creative mode temperature
@@ -70,30 +70,24 @@ async function tgSendMessage(payload: any): Promise<void> {
 
 /* -------------------------------- Emoji stripping -------------------------------- */
 
-// Remove emojis, emoji modifiers, and ZWJ sequences.
-// Uses broad unicode ranges to strip pictographs and flags. Safe for normal text.
 function stripEmojis(s: string): string {
   if (!s) return s;
   return s
-    // Flags & pictographs, symbols, dingbats, transport, etc.
     .replace(/[\u{1F1E6}-\u{1F1FF}\u{1F000}-\u{1F0FF}\u{1F300}-\u{1FAFF}\u{1F900}-\u{1F9FF}\u{2600}-\u{27BF}]/gu, "")
-    // Variation selector & ZWJ
     .replace(/\uFE0F|\u200D/gu, "")
-    // Skin tones (Fitzpatrick)
     .replace(/[\u{1F3FB}-\u{1F3FF}]/gu, "")
     .trim();
 }
 
 /* -------------------------------- Brand soft trimming -------------------------------- */
 
-// Softly remove the "Woolly Eggs universe" stamp when the user didn't bring up the project.
 function softBrandTrim(userText: string, out: string): string {
   if (!out) return out;
   const u = (userText || "").toLowerCase();
   const userMentionsProject =
     /\bwoolly\s*eggs\b/i.test(u) || /\bsyndicate\b/i.test(u) || /\bwool\b/i.test(u);
 
-  if (userMentionsProject) return out; // keep if the topic is clearly project-related
+  if (userMentionsProject) return out;
 
   let s = out.replace(/\b(?:in|from|within)\s+the\s+Woolly\s*Eggs\s+universe\b/gi, "");
   s = s.replace(/\s{2,}/g, " ").replace(/^[,;:\-\s]+/, "").replace(/\s+([,;:.!?])/g, "$1").trim();
@@ -109,6 +103,7 @@ function isProjectTrigger(text: string): boolean {
     /\b(whitelist|allowlist)\b/.test(s) ||
     /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/.test(s) ||
     /\b(syndicate)\b/.test(s) ||
+    /\b(1\s*syndicate|one\s+syndicate|1\s*syn)\b/.test(s) ||
     /\b(wooligotchi|wooli?gotchi|mini-?game|game)\b/.test(s) ||
     /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/.test(s) ||
     /\b(snapshot)\b/.test(s)
@@ -139,6 +134,7 @@ Project facts:
 - Guaranteed whitelist requires 5 Woolly Eggs NFTs (contract: ${contractAddr}).
 - WE Telegram role requires 10 Syndicate NFTs.
 - For a bit of WOOL: https://wooligotchi.vercel.app/
+- If a user asks about “1 Syndicate”, clarify that **1 Syndicate NFT grants a FCFS slot on mainnet**.
 `.trim();
 }
 
@@ -154,10 +150,7 @@ function buildInput(userText: string, creative: boolean) {
 /* -------------------------------- OpenAI call & parsing -------------------------------- */
 
 function extractText(data: any): string {
-  // 1) top-level output_text
   if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
-
-  // 2) output[].content[].type === 'output_text'
   if (Array.isArray(data?.output)) {
     const parts = data.output.flatMap((blk: any) => Array.isArray(blk?.content) ? blk.content : []);
     const texts = parts
@@ -166,8 +159,6 @@ function extractText(data: any): string {
       .filter(Boolean);
     if (texts.length) return texts.join("\n");
   }
-
-  // 3) greedy fallback
   const greedy = Array.isArray(data?.output)
     ? data.output
         .flatMap((blk: any) => Array.isArray(blk?.content) ? blk.content : [])
@@ -178,7 +169,6 @@ function extractText(data: any): string {
     : "";
   if (greedy) return greedy;
 
-  // 4) legacy chat-completions-like
   const ch = data?.choices?.[0]?.message?.content;
   if (typeof ch === "string" && ch.trim()) return ch.trim();
 
@@ -195,7 +185,6 @@ function buildPayload(model: string, input: any, temperature?: number) {
 }
 
 async function askLLM(userText: string, signal?: AbortSignal) {
-  // Creative by default; factual if project triggers detected.
   const creative    = !isProjectTrigger(userText);
   const temperature = creative ? CREATIVE_TEMP : BASE_TEMP;
 
@@ -204,7 +193,6 @@ async function askLLM(userText: string, signal?: AbortSignal) {
   // First try with temperature (some models may not support it).
   let payload: any = buildPayload(MODEL_ID, messages, temperature);
 
-  // Retry loop: handles 429/5xx; also handles 400 "Unsupported parameter: 'temperature'"
   for (let attempt = 1; attempt <= 2; attempt++) {
     const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -220,19 +208,17 @@ async function askLLM(userText: string, signal?: AbortSignal) {
       return DEBUG_OPENAI ? `Debug: empty text from model (model=${MODEL_ID}).` : "I'm not sure.";
     }
 
-    // Read error body (if JSON), build message
     let msg = `LLM error ${r.status}`;
     let errBody: any = null;
     try { errBody = await r.json(); if (errBody?.error?.message) msg += `: ${errBody.error.message}`; } catch {}
 
-    // Auto-fallback: if model doesn't support temperature, retry once without it
     const unsupportedTemp =
       r.status === 400 &&
       typeof errBody?.error?.message === "string" &&
       errBody.error.message.toLowerCase().includes("unsupported parameter: 'temperature'");
 
     if (unsupportedTemp) {
-      payload = buildPayload(MODEL_ID, messages); // no temperature field
+      payload = buildPayload(MODEL_ID, messages); // no temperature
       const r2 = await fetch("https://api.openai.com/v1/responses", {
         method: "POST",
         headers: { Authorization: `Bearer ${OPENAI_KEY}`, "content-type": "application/json" },
@@ -251,7 +237,6 @@ async function askLLM(userText: string, signal?: AbortSignal) {
       }
     }
 
-    // Backoff and retry on 429/5xx
     if ((r.status === 429 || r.status >= 500) && attempt === 1) {
       await new Promise(res => setTimeout(res, 600));
       continue;
@@ -266,7 +251,6 @@ async function askLLM(userText: string, signal?: AbortSignal) {
 /* -------------------------------- HTTP handler -------------------------------- */
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Healthcheck in browser
   if (req.method === "GET") {
     const ready = Boolean(INTERNAL_BEARER) && Boolean(OPENAI_KEY);
     return res.status(ready ? 200 : 500).send(ready ? "ok" : "missing env");
@@ -274,7 +258,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   if (req.method !== "POST") return res.status(200).send("ok");
 
-  // Internal auth from Edge route
   const auth = req.headers.authorization || "";
   if (!INTERNAL_BEARER || auth !== `Bearer ${INTERNAL_BEARER}`) {
     return res.status(403).send("forbidden");
@@ -292,9 +275,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     let reply: string;
     try { reply = await askLLM(text, ctrl.signal); } finally { clearTimeout(to); }
 
-    // 1) optional emoji stripping
     const out0 = NO_EMOJI ? stripEmojis(reply) : reply;
-    // 2) soft brand trimming if user didn't mention the project
     const out  = softBrandTrim(text, out0);
 
     const payload: any = { chat_id: chatId, text: out };
