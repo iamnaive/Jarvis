@@ -104,12 +104,12 @@ function softBrandTrim(userText: string, out: string): string {
 
 function isProjectTrigger(text: string): boolean {
   const s = (text || "").toLowerCase();
-  // Mirrors /api/telegram.ts canned triggers. If any match -> factual mode.
+  // Mirrors /api/telegram.ts canned triggers. NOTE: "wool" removed on purpose.
   return (
     /\b(whitelist|allowlist)\b/.test(s) ||
     /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/.test(s) ||
     /\b(syndicate)\b/.test(s) ||
-    /\b(wooligotchi|wooli?gotchi|mini-?game|game|wool)\b/.test(s) ||
+    /\b(wooligotchi|wooli?gotchi|mini-?game|game)\b/.test(s) ||
     /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/.test(s) ||
     /\b(snapshot)\b/.test(s)
   );
@@ -136,7 +136,7 @@ Do not ask follow-up questions unless the user asks for more.
 Always reply in ENGLISH only. Be brief (1–3 sentences or up to 5 short bullets). Prefer clear, factual answers for project topics.
 Do not invent real-world facts. Do not use emojis, kaomoji, emoji-like unicode, or decorative symbols.
 Project facts:
-- Guaranteed whitelist requires 5 Woolly Eggs NFTs (contract: ${CONTRACT_ADDR}).
+- Guaranteed whitelist requires 5 Woolly Eggs NFTs (contract: ${contractAddr}).
 - WE Telegram role requires 10 Syndicate NFTs.
 - For a bit of WOOL: https://wooligotchi.vercel.app/
 `.trim();
@@ -196,7 +196,7 @@ function buildPayload(model: string, input: any, temperature?: number) {
 
 async function askLLM(userText: string, signal?: AbortSignal) {
   // Creative by default; factual if project triggers detected.
-  let creative    = !isProjectTrigger(userText);
+  const creative    = !isProjectTrigger(userText);
   const temperature = creative ? CREATIVE_TEMP : BASE_TEMP;
 
   const messages = buildInput(userText, creative);
