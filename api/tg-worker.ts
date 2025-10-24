@@ -94,6 +94,29 @@ function softBrandTrim(userText: string, out: string): string {
   return s;
 }
 
+/* -------------------------------- Invite stripping (NEW) -------------------------------- */
+
+// Remove generic "keep-talking" invites that models often append.
+function stripGenericInvites(s: string): string {
+  if (!s) return s;
+  let out = String(s).trim();
+
+  const tailPatterns: RegExp[] = [
+    /(?:what'?s|what is)\s+on your mind(?:\s+today)?\??$/i,
+    /anything else on your mind\??$/i,
+    /how can i (?:help|assist)(?: you)?(?: today)?\??$/i,
+    /what do you need\??$/i,
+    /what would you like to talk about(?: today)?\??$/i,
+    /is there anything else (?:i can help with|you(?:'|’)d like to discuss)\??$/i
+  ];
+  for (const re of tailPatterns) out = out.replace(re, "").trim();
+
+  // Also defang leading filler that often precedes invites.
+  out = out.replace(/^(?:sure|of course|okay|ok|alright)[,!\s-]+/i, "").trim();
+
+  return out || " ";
+}
+
 /* -------------------------------- Personas & prompts -------------------------------- */
 
 function isProjectTrigger(text: string): boolean {
@@ -116,6 +139,8 @@ function systemPromptCreative() {
 You are “Jarvis”, a witty, imaginative assistant from the Woolly Eggs universe.
 Do not mention “Woolly Eggs universe” unless the user explicitly mentions Woolly Eggs or the topic requires it.
 Do not ask follow-up questions unless the user asks for more.
+Never add generic invitations like “What’s on your mind today?”, “Anything else on your mind?”, or “How can I help today?”.
+Never end the message with a question unless the user asked one.
 Tone: playful, concise, sometimes cinematic. Keep answers short (1–3 sentences or up to 5 bullets).
 Do not use emojis, kaomoji, emoji-like unicode, or decorative symbols.
 Avoid unsafe or harmful content; if the topic is sensitive or dangerous, refuse.
@@ -128,6 +153,8 @@ function systemPromptFactual(contractAddr: string) {
 You are “Jarvis”, a concise, friendly assistant from the Woolly Eggs universe.
 Do not mention “Woolly Eggs universe” unless the user explicitly mentions Woolly Eggs or the topic requires it.
 Do not ask follow-up questions unless the user asks for more.
+Never add generic invitations like “What’s on your mind today?”, “Anything else on your mind?”, or “How can I help today?”.
+Never end the message with a question unless the user asked one.
 Always reply in ENGLISH only. Be brief (1–3 sentences or up to 5 short bullets). Prefer clear, factual answers for project topics.
 Do not invent real-world facts. Do not use emojis, kaomoji, emoji-like unicode, or decorative symbols.
 Project facts:
@@ -276,7 +303,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     try { reply = await askLLM(text, ctrl.signal); } finally { clearTimeout(to); }
 
     const out0 = NO_EMOJI ? stripEmojis(reply) : reply;
-    const out  = softBrandTrim(text, out0);
+    const out1 = softBrandTrim(text, out0);
+    const out  = stripGenericInvites(out1); // <-- NEW: cut “What’s on your mind?” tails
 
     const payload: any = { chat_id: chatId, text: out };
     if (typeof replyTo === "number")  payload.reply_to_message_id = replyTo;
