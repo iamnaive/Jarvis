@@ -1,367 +1,198 @@
-// /api/telegram.ts
-// Edge webhook: LLM in groups only (DMs disabled), robust mention detection,
-// optional in-chat diagnostics, safe handoff to /api/tg-worker, and smart thanks-only handling.
+// api/telegram.js
+// Edge webhook for Telegram bot: groups-only LLM, mention-gated, thanks-only handling.
+// Comments: English only.
 
 export const config = { runtime: "edge" };
 
-// --- ENV ---
+/** ===== Env ===== */
 const TG_TOKEN        = process.env.TELEGRAM_TOKEN || process.env.BOT_TOKEN || "";
 const TG_SECRET       = process.env.TELEGRAM_WEBHOOK_SECRET || "";
 const BOT_USERNAME    = (process.env.BOT_USERNAME || "").toLowerCase().replace(/^@/, "");
 const INTERNAL_BEARER = process.env.INTERNAL_BEARER || "";
 
-const DEBUG_CHAT  = (process.env.DEBUG_CHAT  || "false").toLowerCase() === "true";  // verbose [DBG] messages in chat
-const DEBUG_LLM   = (process.env.DEBUG_LLM   || "false").toLowerCase() === "true";  // send worker errors to chat
-const PROBE_REPLY = (process.env.PROBE_REPLY || "false").toLowerCase() === "true";  // send "Working on it…" before LLM handoff
+const DEBUG_CHAT  = (process.env.DEBUG_CHAT  || "false").toLowerCase() === "true";
+const DEBUG_LLM   = (process.env.DEBUG_LLM   || "false").toLowerCase() === "true";
+const PROBE_REPLY = (process.env.PROBE_REPLY || "false").toLowerCase() === "true";
+const NO_EMOJI    = (process.env.NO_EMOJI    || "true").toLowerCase() === "true";
 
-// --- Project constants ---
-const CONTRACT_ADDR = "0x72b6f0b8018ed4153b4201a55bb902a0f152b5c7";
+/** ===== Telegram helpers ===== */
 
-// Quick canned replies (English only)
-const WL_LINES = [
-  `Guaranteed whitelist = 5 Woolly Eggs NFTs. Contract: ${CONTRACT_ADDR}`,
-  `Hold 5 Woolly Eggs — you’re guaranteed on the whitelist. Contract: ${CONTRACT_ADDR}`,
-  `Whitelist is guaranteed when you hold 5 Woolly Eggs NFTs. Contract: ${CONTRACT_ADDR}`,
-  `With 5 Woolly Eggs you’re auto-whitelisted. Contract: ${CONTRACT_ADDR}`,
-];
-const WE_ROLE_LINES = [
-  "The Telegram WE role requires 10 Syndicate NFTs.",
-  "To get the WE role in Telegram, hold 10 Syndicate NFTs.",
-  "WE role → hold 10 Syndicate NFTs (Telegram).",
-  "You’ll receive the WE Telegram role once you hold 10 Syndicate NFTs.",
-];
-const ONE_SYN_LINES = [
-  "Holding **1 Syndicate NFT** grants you a **FCFS slot on mainnet**.",
-  "With **one Syndicate NFT**, you get a **first-come, first-served slot** when mainnet goes live.",
-  "**1 Syndicate** is enough to secure a **FCFS mainnet slot**.",
-  "Own **1 Syndicate NFT** → you have a **FCFS spot on mainnet**."
-];
-const GAME_LINES = [
-  "Want to earn some WOOL? Try the mini-game: https://wooligotchi.vercel.app/",
-  "You can grind a bit of WOOL here: https://wooligotchi.vercel.app/",
-  "Small WOOL boost: play https://wooligotchi.vercel.app/",
-  "For a little WOOL: https://wooligotchi.vercel.app/",
-];
-const GWOOLLY_LINES = ["Gwoolly", "Gwoolly 🧶", "Gwoolly 🥚", "Gwoolly 🥚 🧶"];
-const TWITTER_LINES = [
-  "Official X (Twitter): https://x.com/WoollyEggs",
-  "You can follow us on X here: https://x.com/WoollyEggs",
-  "Our X (Twitter) page: https://x.com/WoollyEggs",
-  "X link: https://x.com/WoollyEggs",
-];
-const SNAPSHOT_LINES = [
-  "The snapshot will occur one day before the mainnet launch.",
-  "Snapshot is planned for 24 hours prior to mainnet going live.",
-  "Expect the snapshot a day ahead of the mainnet launch.",
-  "Snapshot happens one day before mainnet.",
-];
+const TG_API = TG_TOKEN ? `https://api.telegram.org/bot${TG_TOKEN}` : "";
+
+async function tgSend(chatId, text, opts = {}) {
+  if (!TG_API) throw new Error("Missing TELEGRAM_TOKEN");
+  const payload = { chat_id: chatId, text, parse_mode: "HTML", ...opts };
+  const res = await fetch(`${TG_API}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  return res.ok;
+}
+
+function getMessage(update) {
+  return update?.message || update?.edited_message || update?.channel_post || null;
+}
+
+function extractText(msg) {
+  let t = msg?.text || msg?.caption || "";
+  if (typeof t !== "string") t = "";
+  return t;
+}
+
+function isPrivateChat(msg) {
+  return msg?.chat?.type === "private";
+}
+
+function isGroupChat(msg) {
+  const t = msg?.chat?.type || "";
+  return t === "group" || t === "supergroup";
+}
+
+function addressedToBot(text, entities) {
+  if (!BOT_USERNAME) return false;
+  if (!entities || !Array.isArray(entities)) return false;
+  const lowers = (text || "").toLowerCase();
+  for (const e of entities) {
+    if (e.type === "mention") {
+      const mention = lowers.slice(e.offset, e.offset + e.length);
+      if (mention.replace(/^@/, "") === BOT_USERNAME) return true;
+    }
+  }
+  return false;
+}
+
+function isStart(text) {
+  return /^\/start\b/.test(text || "");
+}
+
+// Minimal safe greeting lines (no questions to avoid follow-up invites).
 const GREET_LINES = [
-  "Hey — Jarvis here. How can I help?",
-  "Hi there, I’m Jarvis. What do you need?",
-  "Hello! Jarvis on the line — how can I assist?",
-  "Hey! Jarvis here. Ask away.",
+  "Hey — Jarvis here.",
+  "Hi there, I’m Jarvis.",
+  "Hello! Jarvis here."
 ];
 
-// Regex triggers
-const RE_WL       = /\b(whitelist|allowlist)\b/i;
-const RE_WE       = /\b(we\s*role|we-?role|telegram\s*we\s*role)\b/i;
-const RE_SYN      = /\b(syndicate)\b/i;
-// NOTE: removed standalone "wool" from this regex
-const RE_GAME     = /\b(wooligotchi|wooli?gotchi|mini-?game|game)\b/i;
-const RE_GWOOLLY  = /\b(gwoolly|gwolly|gwoly|gwooly)\b/i;
-const RE_TWITTER  = /\b(twitter|x\.com|x\s*\/?\s*woollyeggs|woolly\s*eggs\s*(twitter|x))\b/i;
-const RE_SNAPSHOT = /\b(snapshot)\b/i;
-const RE_JARVIS   = /\bjarvis\b/i;
-const RE_GREET    = /\b(hi|hello|hey|yo|hiya|howdy|gm|good\s*morning|good\s*evening|good\s*night|sup|what'?s\s*up)\b/i;
-// NEW: “1 syndicate” variations
-const RE_ONE_SYN  = /\b(1\s*syndicate|one\s+syndicate|1\s*syn)\b/i;
+// Thanks-only detector: no question marks, mostly gratitude.
+function isThanksOnly(text) {
+  if (!text) return false;
+  if (/[?!]/.test(text) && !/!$/.test(text)) return false; // treat '?' as not thanks-only
+  const t = text.toLowerCase();
+  return /\b(thanks|thank you|спасибо|thx|ty|appreciate it|благодарю)\b/.test(t)
+    && !/\b(why|how|when|where|what|когда|как|почему|зачем)\b/.test(t);
+}
 
-// Utils
-function rnd(a: string[]) { return a[Math.floor(Math.random() * a.length)]; }
+/** ===== LLM bridge ===== */
 
-// robust Telegram call: reply_parameters + fallbacks for reply/thread errors
-async function tg(method: string, payload: any) {
-  if (!TG_TOKEN) return;
+function reqOrigin() {
+  const v = process.env.VERCEL_URL || "";
+  return v ? `https://${v}` : "http://127.0.0.1:3000";
+}
 
-  // prefer reply_parameters (устойчивее) + поддержка тредов
-  if (payload?.reply_to_message_id) {
-    payload.reply_parameters = { message_id: payload.reply_to_message_id, allow_sending_without_reply: true };
-    delete payload.reply_to_message_id;
+async function callWorker(prompt, mode = "creative", extra = {}) {
+  const url = new URL("/api/tg-worker", reqOrigin());
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${INTERNAL_BEARER}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      prompt,
+      mode,
+      noEmoji: NO_EMOJI,
+      ...extra
+    })
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Worker ${res.status}: ${text || res.statusText}`);
   }
+  const data = await res.json();
+  return (data?.text || "").toString();
+}
 
-  const doCall = async (p: any) =>
-    fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(p),
-    });
+/** ===== Main handler ===== */
 
+export default async function handler(req) {
   try {
-    let r = await doCall(payload);
-    if (r.ok) return;
+    if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
+    if (!TG_TOKEN) return new Response("Bot token missing", { status: 500 });
 
-    const txt = await r.text().catch(() => "");
-    const low = txt.toLowerCase();
-
-    // fallback #1: reply not found → без реплая
-    if (method === "sendMessage" && /repl(?:y|ied)\s+message\s+not\s+found/.test(low)) {
-      const { reply_parameters, ...rest } = payload || {};
-      await doCall(rest);
-      return;
+    if (TG_SECRET) {
+      const secret = req.headers.get("x-telegram-bot-api-secret-token") || "";
+      if (secret !== TG_SECRET) return new Response("Forbidden", { status: 403 });
     }
 
-    // fallback #2: thread not found → убираем message_thread_id
-    if (method === "sendMessage" && /message\s+thread\s+not\s+found/.test(low)) {
-      const { message_thread_id, ...rest } = payload || {};
-      await doCall(rest);
-      return;
+    const update = await req.json();
+    const msg = getMessage(update);
+    if (!msg) return new Response("OK", { status: 200 });
+
+    const chatId = msg.chat?.id;
+    const text = extractText(msg);
+    const entities = msg.entities || msg.caption_entities || [];
+
+    const isGroup = isGroupChat(msg);
+    const dm = isPrivateChat(msg);
+    const hasMention = addressedToBot(text, entities);
+
+    // DMs are disabled (LLM only in groups).
+    if (dm) return new Response("OK", { status: 200 });
+
+    // In groups: respond only if @mentioned.
+    if (isGroup && !hasMention) return new Response("OK", { status: 200 });
+
+    // /start greeting (groups only, on mention)
+    if (isGroup && hasMention && isStart(text)) {
+      const greet = GREET_LINES[Math.floor(Math.random() * GREET_LINES.length)];
+      await tgSend(chatId, greet);
+      return new Response("OK", { status: 200 });
     }
 
-    console.log("TG error", method, r.status, txt.slice(0, 300));
-  } catch (e: any) {
-    console.log("TG fetch error", method, String(e?.message || e));
-  }
-}
-
-function looksLikeQuestion(txt?: string) {
-  if (!txt) return false;
-  const s = txt.toLowerCase();
-  if (s.includes("?")) return true;
-  return /\b(how|what|why|when|where|who|which|can|could|should|help|guide|idea|price|cost|how much)\b/.test(s);
-}
-function containsProjectKeywords(txt?: string) {
-  if (!txt) return false;
-  const s = txt.toLowerCase();
-  // NOTE: removed "wool" here
-  return /\b(woolly\s*eggs|woolly|eggs|syndicate|wooligotchi|whitelist|allowlist|we\s*role|we-?role|mini-?game|snapshot)\b/.test(s);
-}
-function isCommandy(txt?: string) {
-  if (!txt) return false;
-  const s = txt.trim().toLowerCase();
-  return /\b(tell|show|give|make|start|run|explain|calculate|calc|share|provide|list)\b/.test(s);
-}
-function shouldReplyPassive(text?: string) {
-  let score = 0;
-  if (looksLikeQuestion(text)) score++;
-  if (containsProjectKeywords(text)) score++;
-  if (isCommandy(text)) score++;
-  return score >= 2;
-}
-
-// Thanks/ack detection: true if message is a plain thanks/ack without a question
-function isThanksOnly(txt?: string) {
-  if (!txt) return false;
-  const s = txt.toLowerCase().trim();
-  const hasThanks = /\b(thanks|thank you|ty|ok|okay|got it|all good|appreciated|cheers)\b/i.test(s);
-  const hasQuestion = s.includes("?") || /\b(how|what|why|when|where|who|which|can|could|should|help|price|cost|how much)\b/i.test(s);
-  return hasThanks && !hasQuestion;
-}
-
-// Send a single compact debug message (if DEBUG_CHAT=true)
-async function flushDebug(chatId: number, logs: string[], threadId?: number) {
-  if (!DEBUG_CHAT || logs.length === 0) return;
-  const txt = `[DBG]\n` + logs.join("\n").slice(0, 3500);
-  await tg("sendMessage", { chat_id: chatId, text: txt, message_thread_id: threadId });
-}
-
-// --- Handler ---
-export default async function handler(req: Request) {
-  const logs: string[] = [];
-  const log = async (_chatId: number, s: string) => { if (DEBUG_CHAT) logs.push(s); };
-
-  if (req.method === "GET") return new Response("ok");
-
-  // Verify Telegram secret header (matches setWebhook secret_token)
-  if (TG_SECRET) {
-    const sec = req.headers.get("x-telegram-bot-api-secret-token");
-    if (sec !== TG_SECRET) return new Response("forbidden", { status: 403 });
-  }
-
-  // Parse Telegram update
-  let update: any = {};
-  try { update = await req.json(); } catch { return new Response("ok"); }
-
-  const msg      = update.message || update.edited_message || update.channel_post || update.edited_channel_post || null;
-  const chatId   = msg?.chat?.id as number | undefined;
-  const text     = (msg?.text ?? msg?.caption ?? "").trim() as string;
-  const chatType = msg?.chat?.type as string; // private | group | supergroup | channel
-  const isGroup  = chatType === "group" || chatType === "supergroup";
-  const isDM     = chatType === "private";
-  const threadId = (msg?.message_thread_id ?? undefined) as number | undefined;
-  const entities = (msg?.entities || msg?.caption_entities || []) as any[];
-  if (!chatId) return new Response("ok");
-
-  await log(chatId, `▶ update ok | chatType=${chatType} | thread=${threadId ?? "none"}`);
-  if (DEBUG_CHAT && text) await log(chatId, `text="${text.slice(0,180)}"`);
-
-  // Robust mention / reply / name-called / greeting detection
-  const lower = (text || "").toLowerCase();
-
-  const mentionedByText   = BOT_USERNAME ? lower.includes(`@${BOT_USERNAME}`) : false;
-  const mentionedByEntity = (() => {
-    if (!BOT_USERNAME || !text) return false;
-    return entities.some((e) => {
-      if (e?.type !== "mention") return false;
-      const slice = text.slice(e.offset, e.offset + e.length).toLowerCase();
-      return slice === `@${BOT_USERNAME}`;
-    });
-  })();
-  const mentionedUserEntity = (() => {
-    if (!BOT_USERNAME) return false;
-    return entities.some((e) => {
-      if (e?.type !== "text_mention") return false;
-      const u = e.user;
-      return !!(u?.is_bot && u?.username && u.username.toLowerCase() === BOT_USERNAME);
-    });
-  })();
-  const mentioned  = mentionedByText || mentionedByEntity || mentionedUserEntity;
-
-  const replyToBot = !!(msg?.reply_to_message?.from?.is_bot &&
-    (!msg?.reply_to_message?.from?.username ||
-      msg.reply_to_message.from.username.toLowerCase() === BOT_USERNAME));
-
-  const nameCalled = RE_JARVIS.test(lower);
-  const greeted    = RE_GREET.test(lower);
-
-  await log(chatId, `gate: mentioned=${mentioned} (text=${mentionedByText} ent=${mentionedByEntity} userEnt=${mentionedUserEntity}) replyToBot=${!!replyToBot} nameCalled=${!!nameCalled}`);
-
-  // Canned triggers (instant replies; do NOT go to LLM)
-  if (RE_GWOOLLY.test(lower)) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd(GWOOLLY_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
-  }
-  if (RE_TWITTER.test(lower)) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd(TWITTER_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
-  }
-  if (RE_SNAPSHOT.test(lower)) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd(SNAPSHOT_LINES),  reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
-  }
-  // NEW: “1 syndicate” → FCFS slot
-  if (RE_ONE_SYN.test(lower)) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd(ONE_SYN_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
-  }
-  if (RE_WL.test(lower)) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd(WL_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    if (RE_GAME.test(lower)) {
-      await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
+    // Thanks-only: acknowledge once, do not start a new thread of questions.
+    if (isThanksOnly(text)) {
+      // Short non-inviting ack; no questions.
+      await tgSend(chatId, "You’re welcome.");
+      return new Response("OK", { status: 200 });
     }
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
-  }
-  if (RE_WE.test(lower) || (RE_WE.test(lower) && RE_SYN.test(lower))) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd(WE_ROLE_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
-  }
-  if (RE_GAME.test(lower)) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd(GAME_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
-  }
 
-  // Greetings policy:
-  // - DMs: send canned greeting (LLM is off in DMs) and exit.
-  // - Groups: DO NOT send canned greeting; allow it to fall through to LLM.
-  if (isDM && (mentioned || nameCalled) && greeted) {
-    await tg("sendMessage", { chat_id: chatId, text: rnd(GREET_LINES), reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
-  }
-
-  // Short close: pure thanks/ack (no question) → reply once and stop
-  if (isThanksOnly(text)) {
-    await tg("sendMessage", {
-      chat_id: chatId,
-      text: rnd(["Anytime. Take care.", "You're welcome.", "Glad to help."]),
-      reply_to_message_id: msg?.message_id,
-      message_thread_id: threadId
-    });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
-  }
-
-  // DMs policy: never call LLM
-  if (isDM) {
-    await tg("sendMessage", {
-      chat_id: chatId,
-      text: "DM LLM is off. Ask me in the group.",
-      reply_to_message_id: msg?.message_id,
-      message_thread_id: threadId
-    });
-    await flushDebug(chatId, logs, threadId); return new Response("ok");
-  }
-
-  // Group gate: allow LLM on mention/reply/name OR greeting OR heuristics
-  if (isGroup) {
-    const heur = shouldReplyPassive(text);
-    const pass = mentioned || replyToBot || nameCalled || greeted || heur;
-    await log(chatId, `group gate pass=${pass} (heuristics=${heur} greeted=${greeted})`);
-    if (!pass) { await flushDebug(chatId, logs, threadId); return new Response("ok"); }
-  }
-
-  // Delegate to Node worker (/api/tg-worker)
-  const url = new URL("/api/tg-worker", req.url);
-  try {
+    // Optional probe so users see instant feedback.
     if (PROBE_REPLY) {
-      await tg("sendMessage", {
-        chat_id: chatId,
-        text: "Working on it…",
-        reply_to_message_id: msg?.message_id,
-        message_thread_id: threadId
-      });
-      await log(chatId, `probe sent`);
+      await tgSend(chatId, "Working on it…");
     }
 
-    if (!INTERNAL_BEARER) {
-      await tg("sendMessage", { chat_id: chatId, text: "Worker secret not set (INTERNAL_BEARER).", reply_to_message_id: msg?.message_id, message_thread_id: threadId });
-      await log(chatId, `handoff skipped: INTERNAL_BEARER missing`);
-      await flushDebug(chatId, logs, threadId);
-      return new Response("ok");
-    }
+    // Simple routing: "factual" when technical keywords are present.
+    const factual = /\b(contract|address|allowlist|whitelist|abi|rpc|tx|gas|wallet|mint|supply|redis|postgres|leaderboard)\b/i.test(
+      text
+    );
+    const mode = factual ? "factual" : "creative";
 
-    const r = await fetch(url.toString(), {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "authorization": `Bearer ${INTERNAL_BEARER}`,
-      },
-      body: JSON.stringify({
-        chatId,
-        text,
-        replyTo: msg?.message_id ?? null,
-        threadId,
-      }),
-    });
+    const CONTRACT = process.env.NFT_CONTRACT || "0x88c78d5852f45935324c6d100052958f694e8446";
 
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      const brief =
-        r.status === 403 ? "403 (forbidden) — INTERNAL_BEARER mismatch?" :
-        r.status === 500 ? "500 (server) — check OPENAI_API_KEY/MODEL_ID?" :
-        `${r.status} — ${t.slice(0,140)}`;
-      if (DEBUG_LLM) {
-        await tg("sendMessage", {
-          chat_id: chatId,
-          text: `LLM worker error: ${brief}`,
-          reply_to_message_id: msg?.message_id,
-          message_thread_id: threadId
-        });
+    const reply = await (async () => {
+      try {
+        return await callWorker(text, mode, { contractAddr: CONTRACT });
+      } catch (err) {
+        if (DEBUG_LLM) {
+          return `[LLM] ${err?.message || "error"}`;
+        }
+        return "Something went wrong. Try again later.";
       }
-      await log(chatId, `worker status=${r.status} body="${t.slice(0,200)}"`);
-    } else {
-      await log(chatId, `worker status=200 ok`);
-    }
-  } catch (e: any) {
-    const em = String(e?.message || e);
-    if (DEBUG_LLM) {
-      await tg("sendMessage", {
-        chat_id: chatId,
-        text: `LLM handoff failed: ${em}`,
-        reply_to_message_id: msg?.message_id,
-        message_thread_id: threadId
-      });
-    }
-    await log(chatId, `handoff exception: ${em}`);
-  }
+    })();
 
-  await flushDebug(chatId, logs, threadId);
-  return new Response("ok");
+    await tgSend(chatId, reply);
+
+    if (DEBUG_CHAT) {
+      await tgSend(chatId, `[DBG] mode=${mode} mention=${hasMention} dm=${dm}`);
+    }
+
+    return new Response("OK", { status: 200 });
+  } catch (err) {
+    // Best-effort soft error
+    try {
+      const body = await req.text();
+      console.error("TG handler error:", err, " body:", body);
+    } catch {}
+    return new Response("OK", { status: 200 });
+  }
 }
